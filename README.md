@@ -124,19 +124,80 @@ Public Medical Data
 ## Repository Structure
 
 ```
-src/
-├── ingestion/
-├── preprocessing/
-├── normalization/
-├── feature_engineering/
-├── knowledge_graph/
-├── modeling/
-├── explainability/
-├── evaluation/
-├── visualization/
-└── dashboard/
+tekarx/
+│
+├── .github/
+│   ├── ISSUE_TEMPLATE/
+│   ├── workflows/
+│   └── pull_request_template.md
+│
+├── configs/
+│   ├── model.yaml
+│   ├── data.yaml
+│   └── logging.yaml
+│
+├── data/
+│   ├── raw/
+│   ├── external/
+│   ├── interim/
+│   ├── processed/
+│   └── feature_store/
+│
+├── docs/
+│   ├── architecture/
+│   ├── literature_review/
+│   ├── experiments/
+│   ├── diagrams/
+│   └── meeting_notes/
+│
+├── notebooks/
+│   ├── 01_eda.ipynb
+│   ├── 02_feature_engineering.ipynb
+│   ├── 03_baselines.ipynb
+│   └── 04_explainability.ipynb
+│
+├── papers/
+│   ├── reviewed/
+│   ├── summaries/
+│   └── bibliography.bib
+│
+├── scripts/
+│   ├── download_data.py
+│   ├── train.py
+│   ├── evaluate.py
+│   └── inference.py
+│
+├── src/
+│   └── tekarx/
+│       ├── ingestion/
+│       ├── preprocessing/
+│       ├── normalization/
+│       ├── feature_engineering/
+│       ├── knowledge_graph/
+│       ├── modeling/
+│       ├── explainability/
+│       ├── evaluation/
+│       ├── visualization/
+│       ├── dashboard/
+│       ├── utils/
+│       └── __init__.py
+│
+├── tests/
+│
+├── app/
+│   ├── frontend/
+│   └── backend/
+│
+├── assets/
+│
+├── .gitignore
+├── .env.example
+├── AGENTS.md
+├── LICENSE
+├── pyproject.toml
+├── requirements.txt
+└── README.md
 ```
-
 ---
 
 ## Research Principles
