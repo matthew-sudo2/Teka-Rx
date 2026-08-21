@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import inspect
 import json
+import warnings
 from datetime import date
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from tekarx.transform.graph import (
+    _arrow_record_batch_reader,
     _materialize_graph_arrays,
     _stream_feature_query,
     _stream_scalar_query,
@@ -22,6 +25,30 @@ from tekarx.transform.graph_storage import MEMMAP_GRAPH_FORMAT, load_graph_array
 def _write(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(rows), path, compression="snappy")
+
+
+def test_arrow_record_batch_reader_supports_duckdb_1_2_api() -> None:
+    connection = duckdb.connect()
+    try:
+        executed_result = connection.execute("SELECT range AS value FROM range(7)")
+
+        class LegacyDuckDBResult:
+            def fetch_record_batch(self, rows_per_batch: int) -> object:
+                return executed_result.fetch_record_batch(rows_per_batch)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            batches = list(_arrow_record_batch_reader(LegacyDuckDBResult(), 3))
+    finally:
+        connection.close()
+    connection.close()
+
+    assert [batch.num_rows for batch in batches] == [3, 3, 1]
+    assert [
+        value
+        for batch in batches
+        for value in batch.column(0).to_pylist()
+    ] == list(range(7))
 
 
 def _write_graph_inputs(data_dir: Path) -> None:
@@ -192,12 +219,14 @@ def test_default_materializer_has_no_full_table_or_duplicate_edge_operations() -
         inspect.getsource(function)
         for function in (
             _materialize_graph_arrays,
+            _arrow_record_batch_reader,
             _stream_feature_query,
             _stream_scalar_query,
         )
     )
 
     assert "to_arrow_reader" in production_source
+    assert "fetch_record_batch" in production_source
     assert "open_memmap" in production_source
     assert ".to_pylist(" not in production_source
     assert ".to_arrow_table(" not in production_source

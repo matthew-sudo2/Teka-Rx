@@ -633,6 +633,26 @@ def _stream_patient_query(
     )
 
 
+def _arrow_record_batch_reader(
+    result: duckdb.DuckDBPyConnection,
+    batch_size: int,
+) -> Any:
+    """Return a streaming Arrow reader across supported DuckDB releases."""
+    to_arrow_reader = getattr(result, "to_arrow_reader", None)
+    if callable(to_arrow_reader):
+        return to_arrow_reader(batch_size)
+
+    # Older supported DuckDB releases expose the same stream through this name.
+    fetch_record_batch = getattr(result, "fetch_record_batch", None)
+    if callable(fetch_record_batch):
+        return fetch_record_batch(batch_size)
+
+    raise GraphBuildError(
+        "installed DuckDB cannot stream query results as Arrow record batches; "
+        "expected to_arrow_reader() or fetch_record_batch()"
+    )
+
+
 def _stream_feature_query(
     connection: duckdb.DuckDBPyConnection,
     *,
@@ -661,7 +681,7 @@ def _stream_feature_query(
         scalar_paths[artifact_name] = path
         created.append(path)
     result = connection.execute(query)
-    reader = result.to_arrow_reader(batch_size)
+    reader = _arrow_record_batch_reader(result, batch_size)
     offset = 0
     scalar_columns = {source: artifact for source, artifact, _, _ in scalar_specs}
     for batch in reader:
@@ -713,7 +733,7 @@ def _stream_scalar_query(
         arrays[artifact] = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
         paths[artifact] = path
         created.append(path)
-    reader = connection.execute(query).to_arrow_reader(batch_size)
+    reader = _arrow_record_batch_reader(connection.execute(query), batch_size)
     offset = 0
     sources = {source: artifact for source, artifact, _, _ in specs}
     for batch in reader:
