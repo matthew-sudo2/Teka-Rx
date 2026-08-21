@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tekarx"
+version = "0.1.0"
+description = "Reproducible extraction and preparation of drug-safety research data"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+dependencies = [
+  "duckdb>=1.2,<2",
+  "httpx>=0.28,<1",
+  "numpy>=1.26,<3",
+  "pyarrow>=18,<24",
+  "rapidfuzz>=3.12,<4",
+  "tqdm>=4.67,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "ruff>=0.9,<1",
+]
+notebook = [
+  "ipykernel>=6.29,<7",
+  "jupyterlab>=4.3,<5",
+  "pandas>=2.2,<3",
+]
+graph = [
+  "torch>=2.6,<3",
+  "torch-geometric>=2.6,<3",
+  "xgboost>=2.1,<4",
+]
+
+[project.scripts]
+tekarx = "tekarx.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
