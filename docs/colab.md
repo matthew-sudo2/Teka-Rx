@@ -41,8 +41,11 @@ area. Google recommends minimizing mounted-Drive reads and copying active archiv
 runtime where practical. See the
 [official Colab FAQ](https://research.google.com/colaboratory/faq.html).
 
-Allow about 80 GiB of Drive headroom. The notebook also calculates the exact size of the staged
-inputs and refuses the local copy unless `/content` has that space plus 30 GiB of build headroom.
+The notebook requires at least 35 GiB of free Drive space and recommends an 80 GiB reserve. The
+larger figure is operational headroom, not an expected artifact size. A run with 35–80 GiB free
+can proceed, but monitor Drive after every checkpoint and keep unrelated experiments outside the
+dedicated root. The notebook separately calculates the exact size of staged inputs and refuses
+the local copy unless `/content` has that space plus 30 GiB of build headroom.
 
 ## Before opening Colab
 
