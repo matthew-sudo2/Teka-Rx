@@ -179,6 +179,7 @@ def test_dosage_lookup_is_train_frozen_and_combination_dose_is_not_duplicated(
     ) <= 5
 
     dose_edges = pq.read_table(processed / "edges" / "report_drug_dose.parquet")
+    assert "dose_bucket" not in dose_edges.column_names
     combination_edges = dose_edges.filter(
         pc.equal(dose_edges["primaryid"], "test-combination")
     ).to_pylist()

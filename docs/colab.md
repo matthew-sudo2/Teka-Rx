@@ -109,6 +109,14 @@ bounds the otherwise non-spillable ordered string-aggregation and edge-deduplica
 preserving the final pipe-separated lists and separate graph edge tables. Bucket files are deleted
 after the atomic cohort build.
 
+The tabular-feature stage uses the same 64-way patient hash boundary for ingredient mapping,
+strict-prior-date ROR attachment, ATC/exposure/dosage aggregation, and the final wide patient join.
+Dosage reference fitting is separately sharded by DrugCentral ingredient, computes each exact
+quantile vector once per group, and normalizes one edge shard at a time. The stage writes
+bucket-local Snappy parts and streams those parts into the atomic final Parquet file. Its temporary
+bucket tree is local to `data/interim` and is removed on both success and failure; an interrupted
+run never replaces a previous completed feature artifact.
+
 The graph audit requires:
 
 - `tekarx.memmap_graph` format;
