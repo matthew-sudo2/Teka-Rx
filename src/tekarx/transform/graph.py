@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 import duckdb
 import numpy as np
 import pyarrow.parquet as pq
+from tqdm.auto import tqdm
 
 from tekarx.transform.dosage import DOSAGE_PATIENT_FEATURES
 from tekarx.transform.duckdb_runtime import configure_duckdb
@@ -255,7 +257,10 @@ def build_graph(
 
     tabular_path = output_dir / "tekarx_tabular_baseline.npz"
     tabular_temp = tabular_path.with_suffix(".npz.tmp")
-    with tabular_temp.open("wb") as stream:
+    with (
+        _heartbeat_progress("  Compressing tabular baseline"),
+        tabular_temp.open("wb") as stream,
+    ):
         np.savez_compressed(
             stream,
             X=patient_x,
@@ -275,6 +280,7 @@ def build_graph(
         labels,
         split_ids,
         split_id=0,
+        split_name="train",
         batch_size=xgb_batch_size,
     )
     validation_matrix = _quantile_matrix_for_split(
@@ -283,6 +289,7 @@ def build_graph(
         labels,
         split_ids,
         split_id=1,
+        split_name="validation",
         batch_size=xgb_batch_size,
         reference=train_matrix,
     )
@@ -291,27 +298,47 @@ def build_graph(
         f"(early stopping={xgb_early_stopping})",
         flush=True,
     )
-    booster = xgb.train(
-        {
-            "objective": "binary:logistic",
-            "eval_metric": "auc",
-            "tree_method": "hist",
-            "max_depth": xgb_max_depth,
-            "max_leaves": xgb_max_leaves,
-            "grow_policy": "lossguide" if xgb_max_leaves else "depthwise",
-            "eta": 0.03 if xgb_max_leaves else 0.05,
-            "subsample": 0.9,
-            "colsample_bytree": 0.9,
-            "seed": 42,
-            "nthread": threads or 0,
-            "max_bin": 256,
-        },
-        train_matrix,
-        num_boost_round=xgb_rounds,
-        evals=[(validation_matrix, "validation")],
-        early_stopping_rounds=xgb_early_stopping,
-        verbose_eval=25,
+    round_progress = tqdm(
+        total=xgb_rounds,
+        desc="  XGBoost rounds",
+        unit="round",
+        dynamic_ncols=True,
     )
+
+    class RoundProgressCallback(xgb.callback.TrainingCallback):
+        def after_iteration(self, model: Any, epoch: int, evals_log: dict[str, Any]) -> bool:
+            del model, epoch
+            auc_history = evals_log.get("validation", {}).get("auc", [])
+            if auc_history:
+                round_progress.set_postfix_str(f"validation_auc={float(auc_history[-1]):.6f}")
+            round_progress.update(1)
+            return False
+
+    try:
+        booster = xgb.train(
+            {
+                "objective": "binary:logistic",
+                "eval_metric": "auc",
+                "tree_method": "hist",
+                "max_depth": xgb_max_depth,
+                "max_leaves": xgb_max_leaves,
+                "grow_policy": "lossguide" if xgb_max_leaves else "depthwise",
+                "eta": 0.03 if xgb_max_leaves else 0.05,
+                "subsample": 0.9,
+                "colsample_bytree": 0.9,
+                "seed": 42,
+                "nthread": threads or 0,
+                "max_bin": 256,
+            },
+            train_matrix,
+            num_boost_round=xgb_rounds,
+            evals=[(validation_matrix, "validation")],
+            early_stopping_rounds=xgb_early_stopping,
+            callbacks=[RoundProgressCallback()],
+            verbose_eval=False,
+        )
+    finally:
+        round_progress.close()
     validation_scores = booster.predict(validation_matrix)
     validation_auc = binary_auc(np.asarray(labels[validation_mask]), validation_scores)
     model_path = output_dir / "xgboost_baseline.json"
@@ -665,6 +692,37 @@ def _arrow_record_batch_reader(
     )
 
 
+@contextmanager
+def _heartbeat_progress(description: str) -> Any:
+    """Display elapsed time while a blocking native operation has no row-level progress."""
+    progress = tqdm(desc=description, unit="s", dynamic_ncols=True)
+    stopped = threading.Event()
+
+    def heartbeat() -> None:
+        while not stopped.wait(1.0):
+            progress.update(1)
+
+    worker = threading.Thread(target=heartbeat, name="tekarx-progress", daemon=True)
+    worker.start()
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        stopped.set()
+        worker.join(timeout=2.0)
+        progress.close()
+        print(f"  Completed in {time.monotonic() - started:,.1f}s", flush=True)
+
+
+def _execute_with_progress(
+    connection: duckdb.DuckDBPyConnection,
+    description: str,
+    query: str,
+) -> None:
+    with _heartbeat_progress(description):
+        connection.execute(query)
+
+
 def _stream_feature_query(
     connection: duckdb.DuckDBPyConnection,
     *,
@@ -695,28 +753,31 @@ def _stream_feature_query(
     result = connection.execute(query)
     reader = _arrow_record_batch_reader(result, batch_size)
     offset = 0
-    report_every = max(batch_size, 1_000_000)
-    next_report = report_every
     scalar_columns = {source: artifact for source, artifact, _, _ in scalar_specs}
-    for batch in reader:
-        stop = offset + batch.num_rows
-        if stop > row_count:
-            raise GraphBuildError(f"{matrix_name} query returned too many rows")
-        names = batch.schema.names
-        for feature_index in range(feature_count):
-            column = batch.column(names.index(f"feature_{feature_index:04d}"))
-            matrix[offset:stop, feature_index] = np.asarray(
-                column.to_numpy(zero_copy_only=False), dtype=np.float32
-            )
-        for source, artifact in scalar_columns.items():
-            column = batch.column(names.index(source))
-            scalar_arrays[artifact][offset:stop] = np.asarray(
-                column.to_numpy(zero_copy_only=False), dtype=scalar_arrays[artifact].dtype
-            )
-        offset = stop
-        if offset >= next_report or offset == row_count:
-            print(f"  {matrix_name}: {offset:,}/{row_count:,} rows", flush=True)
-            next_report = offset + report_every
+    with tqdm(
+        total=row_count,
+        desc=f"  Streaming {matrix_name}",
+        unit="rows",
+        unit_scale=True,
+        dynamic_ncols=True,
+    ) as progress:
+        for batch in reader:
+            stop = offset + batch.num_rows
+            if stop > row_count:
+                raise GraphBuildError(f"{matrix_name} query returned too many rows")
+            names = batch.schema.names
+            for feature_index in range(feature_count):
+                column = batch.column(names.index(f"feature_{feature_index:04d}"))
+                matrix[offset:stop, feature_index] = np.asarray(
+                    column.to_numpy(zero_copy_only=False), dtype=np.float32
+                )
+            for source, artifact in scalar_columns.items():
+                column = batch.column(names.index(source))
+                scalar_arrays[artifact][offset:stop] = np.asarray(
+                    column.to_numpy(zero_copy_only=False), dtype=scalar_arrays[artifact].dtype
+                )
+            offset = stop
+            progress.update(batch.num_rows)
     if offset != row_count:
         raise GraphBuildError(f"{matrix_name} query returned {offset} rows, expected {row_count}")
     matrix.flush()
@@ -752,22 +813,25 @@ def _stream_scalar_query(
         created.append(path)
     reader = _arrow_record_batch_reader(connection.execute(query), batch_size)
     offset = 0
-    report_every = max(batch_size, 2_000_000)
-    next_report = report_every
     sources = {source: artifact for source, artifact, _, _ in specs}
-    for batch in reader:
-        stop = offset + batch.num_rows
-        if stop > row_count:
-            raise GraphBuildError("streamed query returned too many rows")
-        for source, artifact in sources.items():
-            arrays[artifact][offset:stop] = np.asarray(
-                batch.column(batch.schema.names.index(source)).to_numpy(zero_copy_only=False),
-                dtype=arrays[artifact].dtype,
-            )
-        offset = stop
-        if offset >= next_report or offset == row_count:
-            print(f"  edge arrays: {offset:,}/{row_count:,} rows", flush=True)
-            next_report = offset + report_every
+    with tqdm(
+        total=row_count,
+        desc="  Streaming edge arrays",
+        unit="rows",
+        unit_scale=True,
+        dynamic_ncols=True,
+    ) as progress:
+        for batch in reader:
+            stop = offset + batch.num_rows
+            if stop > row_count:
+                raise GraphBuildError("streamed query returned too many rows")
+            for source, artifact in sources.items():
+                arrays[artifact][offset:stop] = np.asarray(
+                    batch.column(batch.schema.names.index(source)).to_numpy(zero_copy_only=False),
+                    dtype=arrays[artifact].dtype,
+                )
+            offset = stop
+            progress.update(batch.num_rows)
     if offset != row_count:
         raise GraphBuildError(f"streamed query returned {offset} rows, expected {row_count}")
     for array in arrays.values():
@@ -897,6 +961,7 @@ def _quantile_matrix_for_split(
     split_ids: np.ndarray,
     *,
     split_id: int,
+    split_name: str,
     batch_size: int,
     reference: Any | None = None,
 ) -> Any:
@@ -904,17 +969,31 @@ def _quantile_matrix_for_split(
 
     class SplitDataIter(xgb.DataIter):
         def __init__(self) -> None:
+            self._pass_number = 0
+            self._progress: tqdm[Any] | None = None
             super().__init__(release_data=True)
             self._offset = 0
 
         def reset(self) -> None:
+            if self._progress is not None:
+                self._progress.close()
+            self._pass_number += 1
             self._offset = 0
+            self._progress = tqdm(
+                total=features.shape[0],
+                desc=f"  XGBoost {split_name} matrix pass {self._pass_number}",
+                unit="rows",
+                unit_scale=True,
+                dynamic_ncols=True,
+            )
 
         def next(self, input_data: Any) -> int:
             while self._offset < features.shape[0]:
                 start = self._offset
                 stop = min(start + batch_size, features.shape[0])
                 self._offset = stop
+                if self._progress is not None:
+                    self._progress.update(stop - start)
                 selected = np.asarray(split_ids[start:stop]) == split_id
                 if not selected.any():
                     continue
@@ -923,6 +1002,9 @@ def _quantile_matrix_for_split(
                     label=np.asarray(labels[start:stop][selected], dtype=np.float32),
                 )
                 return 1
+            if self._progress is not None:
+                self._progress.close()
+                self._progress = None
             return 0
 
     return xgb.QuantileDMatrix(
@@ -974,7 +1056,9 @@ def _prepare_graph_tables(
     dictionary = _sql_literal(paths["dictionary"].as_posix())
     edges = _sql_literal(paths["edges"].as_posix())
     extra_select = "".join(f", c.{name}" for name in extra_patient_columns)
-    connection.execute(
+    _execute_with_progress(
+        connection,
+        "  Graph prep 1/8: indexing patients",
         f"""
         CREATE TABLE patients AS
         SELECT row_number() OVER (ORDER BY c.report_date, c.primaryid) - 1 AS patient_index,
@@ -998,7 +1082,9 @@ def _prepare_graph_tables(
     if mismatch:
         raise GraphBuildError(f"cohort/case_splits mismatch for {mismatch} patients")
 
-    connection.execute(
+    _execute_with_progress(
+        connection,
+        "  Graph prep 2/8: counting unknown drug names",
         f"""
         CREATE TABLE raw_frequency AS
         SELECT trim(e.drugname) AS faers_raw,
@@ -1014,7 +1100,9 @@ def _prepare_graph_tables(
         GROUP BY trim(e.drugname)
         """
     )
-    connection.execute(
+    _execute_with_progress(
+        connection,
+        "  Graph prep 3/8: ranking frequent unknown drugs",
         f"""
         CREATE TABLE top_unknown AS
         SELECT faers_raw, train_frequency,
@@ -1028,7 +1116,9 @@ def _prepare_graph_tables(
     max_dc_id = connection.execute(
         f"SELECT coalesce(max(dc_id), 0) FROM read_parquet('{dictionary}') WHERE dc_id > 0"
     ).fetchone()[0]
-    connection.execute(
+    _execute_with_progress(
+        connection,
+        "  Graph prep 4/8: mapping report-drug exposures",
         f"""
         CREATE TABLE mapped_report_dc AS
         SELECT DISTINCT e.primaryid, d.dc_id::BIGINT AS dc_id
@@ -1038,7 +1128,9 @@ def _prepare_graph_tables(
         WHERE d.dc_id > 0
         """
     )
-    connection.execute(
+    _execute_with_progress(
+        connection,
+        "  Graph prep 5/8: calculating train-only drug ROR",
         """
         CREATE TABLE train_ror AS
         WITH totals AS (
@@ -1065,7 +1157,9 @@ def _prepare_graph_tables(
         FROM cells
         """
     )
-    connection.execute(
+    _execute_with_progress(
+        connection,
+        "  Graph prep 6/8: assembling mapped drug metadata",
         f"""
         CREATE TABLE known_nodes AS
         WITH metadata AS (
@@ -1097,7 +1191,9 @@ def _prepare_graph_tables(
         if has_other
         else "SELECT NULL::BIGINT, NULL, NULL, NULL::DOUBLE, NULL::INTEGER, NULL WHERE false"
     )
-    connection.execute(
+    _execute_with_progress(
+        connection,
+        "  Graph prep 7/8: indexing drug nodes",
         f"""
         CREATE TABLE drug_nodes AS
         SELECT row_number() OVER (
@@ -1122,7 +1218,9 @@ def _prepare_graph_tables(
         ) nodes
         """
     )
-    connection.execute(
+    _execute_with_progress(
+        connection,
+        "  Graph prep 8/8: assembling exposure edges",
         f"""
         CREATE TABLE graph_edges AS
         WITH known_edges AS (
