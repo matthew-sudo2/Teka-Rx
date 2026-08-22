@@ -230,6 +230,11 @@ def build_parser() -> argparse.ArgumentParser:
     rescue.add_argument("--minimum-pair-reports", type=int, default=25)
     rescue.add_argument("--memory-limit", default="4GB")
     rescue.add_argument("--threads", type=int)
+    rescue.add_argument(
+        "--skip-graph",
+        action="store_true",
+        help="write train-frozen rescue artifacts without rebuilding graph/model artifacts",
+    )
 
     prospective = subparsers.add_parser(
         "build-prospective",
@@ -270,6 +275,25 @@ def build_parser() -> argparse.ArgumentParser:
     gnn.add_argument("--device", help="torch device such as cuda, cuda:0, or cpu")
     gnn.add_argument("--seed", type=int, default=42)
     gnn.add_argument("--edge-chunk-size", type=int, default=250_000)
+    gnn.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        help=(
+            "atomic training-state checkpoint destination; defaults to the processed "
+            "directory"
+        ),
+    )
+    gnn.add_argument(
+        "--resume-from",
+        type=Path,
+        help="resume an interrupted run from a compatible training checkpoint",
+    )
+    gnn.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=5,
+        help="save resumable training state every N epochs (default: 5)",
+    )
     gnn.add_argument(
         "--feature-track",
         choices=("prospective", "prospective-no-dosage", "completed_report"),
@@ -454,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
                 minimum_pair_reports=args.minimum_pair_reports,
                 memory_limit=args.memory_limit,
                 threads=args.threads,
+                rebuild_graph=not args.skip_graph,
             )
             print(json.dumps(asdict(rescue_record), indent=2, sort_keys=True))
             return 0
@@ -486,6 +511,9 @@ def main(argv: list[str] | None = None) -> int:
                 edge_chunk_size=args.edge_chunk_size,
                 evaluate_test=args.evaluate_test,
                 feature_track=args.feature_track,
+                checkpoint_path=args.checkpoint_path,
+                resume_from=args.resume_from,
+                checkpoint_every=args.checkpoint_every,
             )
             print(json.dumps(asdict(gnn_record), indent=2, sort_keys=True))
             return 0

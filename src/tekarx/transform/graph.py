@@ -190,6 +190,7 @@ def build_graph(
             memory_limit=memory_limit,
             threads=threads,
         )
+        print("Graph [1/5]: preparing patient, drug, and exposure tables", flush=True)
         _prepare_graph_tables(
             connection,
             paths=paths,
@@ -212,6 +213,7 @@ def build_graph(
                 """
             ).fetchall()
         )
+        print("Graph [2/5]: streaming numeric arrays to memory-mapped files", flush=True)
         materialization = _materialize_graph_arrays(
             connection,
             output_dir=output_dir,
@@ -228,6 +230,7 @@ def build_graph(
         database.unlink(missing_ok=True)
     if materialization is None:  # pragma: no cover - defensive
         raise GraphBuildError("graph materialization did not complete")
+    print("Graph [3/5]: validating descriptor and writing tabular arrays", flush=True)
     graph_path = output_dir / "tekarx_graph.pt"
     array_manifest_path = Path(materialization["manifest_path"])
     _write_graph_descriptor(graph_path, array_manifest_path=array_manifest_path, torch=torch)
@@ -265,6 +268,7 @@ def build_graph(
         )
     os.replace(tabular_temp, tabular_path)
 
+    print("Graph [4/5]: building bounded XGBoost quantile matrices", flush=True)
     train_matrix = _quantile_matrix_for_split(
         xgb,
         patient_x,
@@ -281,6 +285,11 @@ def build_graph(
         split_id=1,
         batch_size=xgb_batch_size,
         reference=train_matrix,
+    )
+    print(
+        f"Graph [5/5]: training XGBoost for up to {xgb_rounds:,} rounds "
+        f"(early stopping={xgb_early_stopping})",
+        flush=True,
     )
     booster = xgb.train(
         {
@@ -301,7 +310,7 @@ def build_graph(
         num_boost_round=xgb_rounds,
         evals=[(validation_matrix, "validation")],
         early_stopping_rounds=xgb_early_stopping,
-        verbose_eval=False,
+        verbose_eval=25,
     )
     validation_scores = booster.predict(validation_matrix)
     validation_auc = binary_auc(np.asarray(labels[validation_mask]), validation_scores)
@@ -328,7 +337,7 @@ def build_graph(
         materialization_batch_size=materialization_batch_size,
         edge_index_dtype=str(bundle.arrays["edge_patient_index"].dtype),
     )
-    print(f"XGBoost validation AUC: {validation_auc:.6f}")
+    print(f"XGBoost validation AUC: {validation_auc:.6f}", flush=True)
     _write_manifest(
         output_dir / "graph_manifest.json",
         record,
@@ -686,6 +695,8 @@ def _stream_feature_query(
     result = connection.execute(query)
     reader = _arrow_record_batch_reader(result, batch_size)
     offset = 0
+    report_every = max(batch_size, 1_000_000)
+    next_report = report_every
     scalar_columns = {source: artifact for source, artifact, _, _ in scalar_specs}
     for batch in reader:
         stop = offset + batch.num_rows
@@ -703,6 +714,9 @@ def _stream_feature_query(
                 column.to_numpy(zero_copy_only=False), dtype=scalar_arrays[artifact].dtype
             )
         offset = stop
+        if offset >= next_report or offset == row_count:
+            print(f"  {matrix_name}: {offset:,}/{row_count:,} rows", flush=True)
+            next_report = offset + report_every
     if offset != row_count:
         raise GraphBuildError(f"{matrix_name} query returned {offset} rows, expected {row_count}")
     matrix.flush()
@@ -738,6 +752,8 @@ def _stream_scalar_query(
         created.append(path)
     reader = _arrow_record_batch_reader(connection.execute(query), batch_size)
     offset = 0
+    report_every = max(batch_size, 2_000_000)
+    next_report = report_every
     sources = {source: artifact for source, artifact, _, _ in specs}
     for batch in reader:
         stop = offset + batch.num_rows
@@ -749,6 +765,9 @@ def _stream_scalar_query(
                 dtype=arrays[artifact].dtype,
             )
         offset = stop
+        if offset >= next_report or offset == row_count:
+            print(f"  edge arrays: {offset:,}/{row_count:,} rows", flush=True)
+            next_report = offset + report_every
     if offset != row_count:
         raise GraphBuildError(f"streamed query returned {offset} rows, expected {row_count}")
     for array in arrays.values():

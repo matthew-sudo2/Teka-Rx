@@ -4,6 +4,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from tekarx.extract.common import sha256_file
 from tekarx.transform.faers import build_faers
 
 
@@ -102,3 +103,35 @@ def test_build_faers_combines_historical_deletion_file_names(tmp_path: Path) -> 
         "ADR19Q1DeletedCases.txt",
         "AllDeletedCases.txt",
     ]
+
+
+def test_build_faers_records_an_empty_delete_table_when_archive_has_no_delete_file(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    extracted = data_dir / "raw" / "faers" / "2019Q1" / "extracted"
+    extracted.mkdir(parents=True)
+    (extracted / ".complete").write_text("verified extraction\n", encoding="utf-8")
+    archive = data_dir / "raw" / "faers" / "2019Q1" / "source.zip"
+    archive.write_bytes(b"official archive fixture")
+
+    first = build_faers(data_dir=data_dir, quarters=["2019Q1"], tables=("delete",))
+    second = build_faers(data_dir=data_dir, quarters=["2019Q1"], tables=("delete",))
+
+    assert first[0].rows == 0
+    source_entries = json.loads(first[0].source_path)
+    assert source_entries == [
+        {
+            "path": "raw/faers/2019Q1/source.zip",
+            "role": "archive_without_delete_file",
+            "sha256": sha256_file(archive),
+        }
+    ]
+    assert first[0].cached is False
+    assert second[0].cached is True
+    deleted_path = data_dir / "interim" / "faers" / "delete" / "2019Q1.parquet"
+    deleted = pq.read_table(deleted_path)
+    assert deleted.column_names == ["caseid", "quarter"]
+    assert deleted.num_rows == 0
+    metadata = deleted.schema.metadata or {}
+    assert json.loads(metadata[b"tekarx.source_path"]) == source_entries

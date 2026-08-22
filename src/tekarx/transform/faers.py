@@ -113,6 +113,23 @@ def _build_delete_table(*, data_dir: Path, quarter: str) -> ParquetBuildRecord:
         }
         for source in sources
     ]
+    if not source_entries:
+        print(
+            f"WARNING: FAERS {quarter} archive contains no deletion-case TXT file; "
+            "writing a provenance-marked empty delete table.",
+            flush=True,
+        )
+        archive = data_dir / "raw" / "faers" / quarter / "source.zip"
+        evidence = archive if archive.is_file() else _extracted_root(
+            data_dir=data_dir, quarter=quarter
+        ) / ".complete"
+        source_entries.append(
+            {
+                "path": evidence.relative_to(data_dir).as_posix(),
+                "sha256": sha256_file(evidence),
+                "role": "archive_without_delete_file",
+            }
+        )
     source_reference = json.dumps(source_entries, sort_keys=True, separators=(",", ":"))
     source_sha256 = hashlib.sha256(source_reference.encode()).hexdigest()
     destination = data_dir / "interim" / "faers" / "delete" / f"{quarter}.parquet"
@@ -182,8 +199,6 @@ def _find_delete_source_files(*, data_dir: Path, quarter: str) -> list[Path]:
             or "DELETEDCASE" in path.stem.upper()
         )
     )
-    if not matches:
-        raise FaersBuildError(f"expected deletion-case TXT files for {quarter}, found 0")
     return matches
 
 

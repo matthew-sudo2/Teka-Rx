@@ -103,3 +103,120 @@ def test_feature_rescue_freezes_train_pairs_and_auxiliary_outcomes(tmp_path: Pat
     assert rows["p1"]["is_death"] == 1
     assert rows["p1"]["is_hospitalization"] == 1
     assert "reporter_unknown" not in rows["p4"]
+
+
+def test_feature_rescue_buckets_preserve_strict_time_and_unique_ingredients(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    processed = data_dir / "processed"
+    _write(
+        processed / "tekarx_cohort.parquet",
+        [
+            {
+                "primaryid": "same-1",
+                "report_date": date(2023, 1, 1),
+                "drug_list_str": "A|A ALIAS|B",
+                "outcome_codes": "DE",
+                "is_serious": 1,
+                "split": "train",
+            },
+            {
+                "primaryid": "same-2",
+                "report_date": date(2023, 1, 1),
+                "drug_list_str": "A|B",
+                "outcome_codes": "HO",
+                "is_serious": 1,
+                "split": "train",
+            },
+            {
+                "primaryid": "negative-control",
+                "report_date": date(2023, 2, 1),
+                "drug_list_str": "C",
+                "outcome_codes": "",
+                "is_serious": 0,
+                "split": "train",
+            },
+            {
+                "primaryid": "positive-control",
+                "report_date": date(2023, 3, 1),
+                "drug_list_str": "C",
+                "outcome_codes": "LT",
+                "is_serious": 1,
+                "split": "train",
+            },
+            {
+                "primaryid": "heldout",
+                "report_date": date(2024, 1, 1),
+                "drug_list_str": "A ALIAS|B",
+                "outcome_codes": "HO",
+                "is_serious": 1,
+                "split": "validation",
+            },
+            {
+                "primaryid": "undated-train",
+                "report_date": None,
+                "drug_list_str": "A|B",
+                "outcome_codes": "",
+                "is_serious": 0,
+                "split": "train",
+            },
+        ],
+    )
+    _write(
+        processed / "drug_dictionary.parquet",
+        [
+            {"faers_raw": "A", "dc_id": 1},
+            {"faers_raw": "A ALIAS", "dc_id": 1},
+            {"faers_raw": "B", "dc_id": 2},
+            {"faers_raw": "C", "dc_id": 3},
+        ],
+    )
+    _write(
+        data_dir / "interim" / "faers" / "indi" / "2023Q1.parquet",
+        [
+            {"primaryid": "same-1", "indi_pt": "Lung cancer"},
+            {"primaryid": "same-1", "indi_pt": "Lung cancer"},
+            {"primaryid": "heldout", "indi_pt": "Lung cancer"},
+            {"primaryid": "heldout", "indi_pt": "Lung cancer"},
+            {"primaryid": "heldout", "indi_pt": "Novel heldout disease"},
+        ],
+    )
+
+    record = feature_rescue.build_feature_rescue(
+        data_dir=data_dir,
+        top_pairs=5,
+        minimum_pair_reports=1,
+        memory_limit="512MB",
+        threads=1,
+        rebuild_graph=False,
+    )
+    rows = {
+        row["primaryid"]: row for row in pq.read_table(record.output_path).to_pylist()
+    }
+    pair_rows = pq.read_table(record.pair_lookup_path).to_pylist()
+
+    assert len(pair_rows) == 1
+    assert pair_rows[0]["dc_id_1"] == 1
+    assert pair_rows[0]["dc_id_2"] == 2
+    assert pair_rows[0]["a"] == 2
+    assert pair_rows[0]["b"] == 0
+    assert pair_rows[0]["pair_reports"] == 2
+    assert rows["same-1"]["scored_pair_count"] == 0
+    assert rows["same-2"]["scored_pair_count"] == 0
+    assert rows["heldout"]["scored_pair_count"] == 1
+    assert rows["undated-train"]["scored_pair_count"] == 1
+    assert rows["heldout"]["num_high_risk_pairs"] == 1
+    assert rows["heldout"]["max_pair_log_ror"] > 1.0
+    assert sum(rows["same-1"][f"indication_hash_{index:02d}"] for index in range(32)) == 1
+    assert sum(rows["heldout"][f"indication_hash_{index:02d}"] for index in range(32)) == 1
+    output_columns = set(pq.ParquetFile(record.output_path).schema_arrow.names)
+    assert "__tekarx_patient_bucket" not in output_columns
+    assert "__tekarx_pair_bucket" not in output_columns
+
+
+def test_feature_rescue_cli_can_checkpoint_without_building_the_graph() -> None:
+    from tekarx.cli import build_parser
+
+    args = build_parser().parse_args(["feature-rescue", "--skip-graph"])
+    assert args.skip_graph is True

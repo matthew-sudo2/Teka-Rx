@@ -44,13 +44,16 @@ runtime where practical. See the
 The notebook requires at least 35 GiB of free Drive space and recommends an 80 GiB reserve. The
 larger figure is operational headroom, not an expected artifact size. A run with 35–80 GiB free
 can proceed, but monitor Drive after every checkpoint and keep unrelated experiments outside the
-dedicated root. The notebook separately calculates the exact size of staged inputs and refuses
-the local copy unless `/content` has that space plus 30 GiB of build headroom.
+dedicated root. The notebook calculates only the bytes still needing a copy and refuses the local
+copy unless `/content` has those bytes plus 45 GiB of build headroom. On restart it removes only
+known interrupted DuckDB/bucket scratch under `/content/tekarx-data/interim`; it never removes
+durable Drive inputs.
 
 ## Before opening Colab
 
 The notebook clones GitHub. Commit and push the reviewed implementation before running it, then
-replace `GIT_REF = "origin/main"` with the full commit SHA. The notebook records the resolved SHA
+replace the `GIT_REF` placeholder with the full reviewed commit SHA. Mutable refs such as
+`origin/main` are rejected. The notebook records the resolved SHA
 and package/runtime versions beside the artifacts. Never put a GitHub personal access token,
 Google service-account file, or other credential in the notebook.
 
@@ -58,6 +61,19 @@ Current TekaRx metadata requires Python 3.12 or newer. Use Colab's current runti
 preinstalled compatible CUDA-enabled Torch rather than installing the Windows RTX 4050 wheel.
 Current and pinnable runtime versions are listed in the
 [official runtime-version page](https://research.google.com/colaboratory/runtime-version-faq.html).
+
+## After a runtime reset
+
+Assume every Python variable, import, package install, and `/content` artifact is gone. Drive
+checkpoints remain. In a CPU build runtime, rerun Mount Drive through Dependency audit, then the
+Experiment plan and Source audit cells. The three source-staging cells will print `SKIP` when the
+source marker is valid. Continue with Restore build inputs, Build features, Verify features, Build
+graph, and Verify graph. Do not advance to CUDA training on a CPU runtime.
+
+After changing to a GPU runtime, rerun only Mount Drive through Dependency audit, then Restore
+graph, GPU audit, Train GNN, and Persist model. The restore cell imports its own graph loader and
+does not depend on state from the CPU graph-audit cell. If the GPU runtime resets, repeat that GPU
+sequence; training resumes from the latest compatible epoch checkpoint in Drive.
 
 ## Stage 1: persistent source staging
 
@@ -71,8 +87,10 @@ Use a standard CPU runtime. The notebook:
 6. writes `_SOURCES_SUCCESS.json` only after validation passes.
 
 FAERS and DrugCentral downloads are checksum-cached. FAERS table conversion is also cached by
-source checksum. Rerunning a completed cell is safe. A killed HTTP request restarts only the
-current file; completed quarters remain cached.
+source checksum. A valid `_SOURCES_SUCCESS.json` makes expensive staging cells print `SKIP`; the
+source-audit cell still rechecks the Parquet footers before advancing. A killed HTTP request
+restarts only the current file. Historical FDA ZIPs with no deletion-case text file receive a
+provenance-marked empty `delete` Parquet tied to the source archive.
 
 If a runtime stops after a ZIP was created but before `extracted/.complete`, inspect that exact
 quarter. Move only its incomplete `extracted` directory aside before retrying. Do not delete or
@@ -83,12 +101,14 @@ replace the complete raw source tree.
 Choose a high-memory CPU runtime if available and rerun the notebook setup cells. The notebook
 copies these prerequisites to `/content/tekarx-data`:
 
-- all interim FAERS, DrugCentral, and optional DailyMed Parquet files;
+- only the FAERS, DrugCentral, and optional DailyMed interim directories;
 - exactly one raw DrugCentral `.sql.gz` dump;
-- a prior processed checkpoint when its completion marker exists.
+- only the artifacts required by the deepest valid processed-stage checkpoint.
 
-Raw FAERS ZIP and TXT files remain in Drive. The prospective pipeline is run with `--skip-graph`,
-then its cohort and features are validated and checkpointed. The graph is built separately with:
+Raw FAERS ZIP and TXT files remain in Drive. The build is split into cohort, dictionary,
+tabular/dosage, and feature-rescue commands. Every stage uploads its own files and writes its
+success marker last, so a reset resumes from the deepest valid stage. The graph is built
+separately with:
 
 ```text
 storage          memory-mapped
@@ -117,6 +137,12 @@ bucket-local Snappy parts and streams those parts into the atomic final Parquet 
 bucket tree is local to `data/interim` and is removed on both success and failure; an interrupted
 run never replaces a previous completed feature artifact.
 
+The feature-rescue stage is likewise 64-way bounded. It generates unique ingredient pairs per
+patient bucket, repartitions by drug pair, computes strict-prior-date training histories one pair
+bucket at a time, and reduces patient partials immediately. Its train-only indication vocabulary
+is deduplicated and partitioned before the 32 hash counts are built. This removes the former
+global pair/history/ASOF state that exhausted the 6 GB DuckDB limit.
+
 The graph audit requires:
 
 - `tekarx.memmap_graph` format;
@@ -126,13 +152,15 @@ The graph audit requires:
 - one row per `primaryid` and one retained version per `caseid`;
 - no missing quarter in `cohort_manifest.json`.
 
-Graph sidecars are uploaded before the descriptor and manifests. `_GRAPH_SUCCESS.json` is written
-last. A runtime must never restore a graph checkpoint without this marker.
+Graph sidecars are uploaded into a unique `processed/graph_checkpoints/<checkpoint-id>/` staging
+directory, size/hash checked, and renamed before `_GRAPH_SUCCESS.json` publishes its pointer. The
+previous graph stays available until its replacement model is durable. A runtime must never
+restore a graph checkpoint without this marker.
 
 ## Stage 3: CUDA training
 
-Switch to a GPU runtime and rerun setup. Restore the descriptor and the complete
-`tekarx_graph_arrays/` directory to `/content`, then train with the prospective feature track.
+Switch to a GPU runtime and rerun setup. Restore the versioned graph descriptor and arrays to
+`/content`, then train with the prospective feature track.
 The temporary neighbor matrix is local and removed after training.
 
 The current trainer supports CPU/CUDA, not TPU. A TPU port would require PyTorch/XLA device,
@@ -140,12 +168,11 @@ synchronization, loader, and checkpoint changes; selecting a TPU in Colab is not
 the [PyTorch/XLA migration guide](https://docs.pytorch.org/xla/master/learn/migration-to-xla-on-tpus.html).
 
 Validation controls early stopping. The notebook deliberately contains no command that consumes
-test labels. After training, it asserts that `test_auc` is null and `test_evaluated` is false,
-then uploads the model and writes `_GNN_SUCCESS.json` last.
-
-The GNN currently saves atomically after training but has no epoch-resume checkpoint. A runtime
-termination during training requires restarting that training cell. Source, feature, and graph
-checkpoints remain reusable.
+test labels. Training writes a small atomic state checkpoint to Drive after epoch 1, every five
+epochs, at the final requested epoch, and when early stopping fires. It includes model, optimizer,
+best validation state, normalization, history, and RNG state; resume rejects a different graph or
+hyperparameters. The final model is published under
+`processed/gnn_checkpoints/<checkpoint-id>/`, then `_GNN_SUCCESS.json` is written last.
 
 ## Resume table
 
@@ -153,10 +180,12 @@ checkpoints remain reusable.
 |---|---|
 | Raw download | Checksum cache; the active partial request restarts |
 | FAERS/DrugCentral Parquet | Source-checksum cache |
-| Cohort/dictionary | Input/build-version cache where supported |
-| Dosage/enrichment/rescue | Atomic files; rerun the active build cell |
-| Graph | Restore only with `_GRAPH_SUCCESS.json` |
-| GNN | No partial-epoch resume; restore graph and retrain |
+| Cohort | `_COHORT_SUCCESS.json`; restore exact cohort and edge files |
+| Dictionary | `_DICTIONARY_SUCCESS.json`; restore cohort plus dictionary |
+| Dosage/enrichment | `_TABULAR_SUCCESS.json`; restore through tabular artifacts |
+| Feature rescue | `_RESCUE_SUCCESS.json` / `_FEATURES_SUCCESS.json` |
+| Graph | Restore the versioned directory referenced by `_GRAPH_SUCCESS.json` |
+| GNN | Resume the compatible atomic Drive checkpoint from its last saved epoch |
 
 Managed Colab hardware and runtime durations are dynamic. Free runtimes may terminate before a
 long build completes; use the staged checkpoints and consider a paid high-memory/GPU runtime for
@@ -169,15 +198,20 @@ Keep these together under Drive `processed/`:
 ```text
 cohort and edge Parquet files
 drug dictionary and train-frozen lookups
-tekarx_graph.pt
-tekarx_graph_arrays/
-graph_manifest.json
-tekarx_inductive_gnn.pt
-tekarx_inductive_gnn_manifest.json
+graph_checkpoints/<checkpoint-id>/
+gnn_training_checkpoints/<graph-and-run-id>.pt
+gnn_checkpoints/<checkpoint-id>/
 colab_run_metadata.json
-colab_training_metadata.json
 _*_SUCCESS.json
 ```
+
+## Outcome-label interpretation
+
+FAERS `OUTC_COD` values represent documented serious outcomes. Reports without an OUTC row supply
+the negative class in this cohort; they are **not** verified-safe reports. Dropping all missing
+outcomes would remove the negative class under the current target definition. Interpret
+`is_serious` as “documented serious outcome versus no documented serious outcome,” retain the
+split-level missing-outcome audit, and do not make causal or clinical-safety claims from it.
 
 Model outputs are research signals for retrospective evaluation. They do not demonstrate that a
 drug caused an event and must not be used as diagnoses or treatment recommendations.

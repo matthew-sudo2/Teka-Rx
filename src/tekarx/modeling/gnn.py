@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
 import json
 import os
 import random
@@ -38,6 +39,9 @@ PROSPECTIVE_EXCLUDED_FEATURES = {
     "reporter_unknown",
 }
 FEATURE_TRACKS = ("prospective", "prospective-no-dosage", "completed_report")
+GNN_CHECKPOINT_FORMAT = "tekarx.inductive_gnn_training_checkpoint"
+GNN_CHECKPOINT_VERSION = 1
+DEFAULT_CHECKPOINT_EVERY = 5
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,9 @@ def train_inductive_gnn(
     edge_chunk_size: int = 250_000,
     evaluate_test: bool = False,
     feature_track: str = "prospective",
+    checkpoint_path: Path | None = None,
+    resume_from: Path | None = None,
+    checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
 ) -> GNNTrainRecord:
     """Train a one-hop mean-aggregation GNN without held-out message leakage.
 
@@ -115,12 +122,30 @@ def train_inductive_gnn(
         learning_rate=learning_rate,
         patience=patience,
         edge_chunk_size=edge_chunk_size,
+        checkpoint_every=checkpoint_every,
     )
     if feature_track not in FEATURE_TRACKS:
         raise ValueError(f"feature_track must be one of {FEATURE_TRACKS}")
     graph_path = graph_path or data_dir / "processed" / "tekarx_graph.pt"
     if not graph_path.is_file():
         raise GNNTrainError(f"missing graph artifact: {graph_path}")
+
+    output_dir = data_dir / "processed"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_prefix = _artifact_prefix(feature_track)
+    model_path = output_dir / f"{artifact_prefix}.pt"
+    manifest_path = output_dir / f"{artifact_prefix}_manifest.json"
+    resume_source = Path(resume_from).resolve() if resume_from is not None else None
+    checkpoint_target = Path(
+        checkpoint_path
+        or resume_from
+        or output_dir / f"{artifact_prefix}_training_checkpoint.pt"
+    ).resolve()
+    protected_paths = {graph_path.resolve(), model_path.resolve(), manifest_path.resolve()}
+    if checkpoint_target in protected_paths:
+        raise GNNTrainError(
+            "training checkpoint path must differ from the graph, final model, and manifest"
+        )
 
     _seed_everything(torch, seed)
     training_graph = _load_training_graph(
@@ -137,10 +162,38 @@ def train_inductive_gnn(
         raise GNNTrainError(f"invalid torch device: {requested_device}") from exc
     if training_device.type == "cuda" and not torch.cuda.is_available():
         raise GNNTrainError("CUDA was requested but is not available")
+    graph_fingerprint = _graph_fingerprint(graph_path, training_graph)
+    checkpoint_configuration = _checkpoint_configuration(
+        graph_fingerprint=graph_fingerprint,
+        feature_track=feature_track,
+        feature_names=feature_names,
+        batch_size=batch_size,
+        hidden_channels=hidden_channels,
+        dropout=dropout,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        patience=patience,
+        seed=seed,
+        edge_chunk_size=edge_chunk_size,
+        device_type=training_device.type,
+    )
+    resume_payload = None
+    if resume_source is not None:
+        resume_payload = _load_training_checkpoint(
+            resume_source,
+            expected_configuration=checkpoint_configuration,
+            maximum_epoch=epochs,
+            torch=torch,
+        )
+        print(
+            f"Resuming after epoch {resume_payload['completed_epoch']} from "
+            f"{resume_source}",
+            flush=True,
+        )
     temporary_neighbor_path: Path | None = None
     drug_neighbors: object | None = None
     try:
-        print("Aggregating one-hop drug neighborhoods in bounded CPU chunks...")
+        print("Aggregating one-hop drug neighborhoods in bounded CPU chunks...", flush=True)
         if training_graph.storage_backend == "numpy_memmap_v1":
             descriptor_dir = graph_path.resolve().parent
             handle, temporary_name = tempfile.mkstemp(
@@ -168,24 +221,45 @@ def train_inductive_gnn(
             )
             neighbor_storage = "cpu_tensor"
 
-        print("Computing training-only normalization statistics in bounded chunks...")
-        patient_mean, patient_std = _chunked_train_standardization(
-            training_graph.patient_x,
-            training_graph.split_id,
-            feature_indices=selected_indices,
-            chunk_size=edge_chunk_size,
-            torch=torch,
-        )
-        neighbor_mean, neighbor_std = _chunked_train_standardization(
-            drug_neighbors,
-            training_graph.split_id,
-            feature_indices=None,
-            chunk_size=edge_chunk_size,
-            torch=torch,
-        )
+        if resume_payload is None:
+            print(
+                "Computing training-only normalization statistics in bounded chunks...",
+                flush=True,
+            )
+            patient_mean, patient_std = _chunked_train_standardization(
+                training_graph.patient_x,
+                training_graph.split_id,
+                feature_indices=selected_indices,
+                chunk_size=edge_chunk_size,
+                torch=torch,
+                progress_label="Patient normalization",
+            )
+            neighbor_mean, neighbor_std = _chunked_train_standardization(
+                drug_neighbors,
+                training_graph.split_id,
+                feature_indices=None,
+                chunk_size=edge_chunk_size,
+                torch=torch,
+                progress_label="Neighbor normalization",
+            )
+        else:
+            normalization = resume_payload["normalization"]
+            patient_mean = normalization["patient_mean"]
+            patient_std = normalization["patient_std"]
+            neighbor_mean = normalization["neighbor_mean"]
+            neighbor_std = normalization["neighbor_std"]
 
         patient_channels = len(selected_indices)
         drug_channels = _matrix_shape(drug_neighbors)[1]
+        _validate_normalization_dimensions(
+            patient_mean=patient_mean,
+            patient_std=patient_std,
+            neighbor_mean=neighbor_mean,
+            neighbor_std=neighbor_std,
+            patient_channels=patient_channels,
+            drug_channels=drug_channels,
+            torch=torch,
+        )
         model = _make_model(
             nn,
             patient_channels=patient_channels,
@@ -208,12 +282,33 @@ def train_inductive_gnn(
             pos_weight=torch.tensor(negatives / positives, device=training_device)
         )
 
-        best_auc = float("-inf")
-        best_epoch = 0
-        best_state: dict[str, object] | None = None
-        stale_epochs = 0
-        history: list[dict[str, float | int]] = []
-        for epoch in range(1, epochs + 1):
+        if resume_payload is None:
+            best_auc = float("-inf")
+            best_epoch = 0
+            best_state: dict[str, object] | None = None
+            stale_epochs = 0
+            history: list[dict[str, float | int]] = []
+            completed_epoch = 0
+        else:
+            model.load_state_dict(resume_payload["model_state_dict"])
+            optimizer.load_state_dict(resume_payload["optimizer_state_dict"])
+            _optimizer_to_device(optimizer, training_device, torch=torch)
+            best_auc = float(resume_payload["best_auc"])
+            best_epoch = int(resume_payload["best_epoch"])
+            best_state = resume_payload["best_state_dict"]
+            stale_epochs = int(resume_payload["stale_epochs"])
+            history = copy.deepcopy(resume_payload["history"])
+            completed_epoch = int(resume_payload["completed_epoch"])
+            _restore_rng_state(resume_payload["rng_state"], training_device, torch=torch)
+
+        for epoch in range(completed_epoch + 1, epochs + 1):
+            if stale_epochs >= patience:
+                print(
+                    f"Checkpoint already satisfied early stopping at epoch "
+                    f"{completed_epoch}.",
+                    flush=True,
+                )
+                break
             model.train()
             epoch_loss = 0.0
             observed = 0
@@ -293,7 +388,8 @@ def train_inductive_gnn(
             )
             print(
                 f"Epoch {epoch:03d}: train_loss={mean_loss:.6f} "
-                f"validation_auc={validation_auc:.6f}"
+                f"validation_auc={validation_auc:.6f}",
+                flush=True,
             )
             if validation_auc > best_auc + 1e-6:
                 best_auc = validation_auc
@@ -302,8 +398,33 @@ def train_inductive_gnn(
                 stale_epochs = 0
             else:
                 stale_epochs += 1
-                if stale_epochs >= patience:
-                    break
+            should_stop = stale_epochs >= patience
+            if epoch == 1 or epoch % checkpoint_every == 0 or epoch == epochs or should_stop:
+                _write_training_checkpoint(
+                    checkpoint_target,
+                    configuration=checkpoint_configuration,
+                    completed_epoch=epoch,
+                    model=model,
+                    optimizer=optimizer,
+                    best_state=best_state,
+                    best_auc=best_auc,
+                    best_epoch=best_epoch,
+                    stale_epochs=stale_epochs,
+                    history=history,
+                    patient_mean=patient_mean,
+                    patient_std=patient_std,
+                    neighbor_mean=neighbor_mean,
+                    neighbor_std=neighbor_std,
+                    training_device=training_device,
+                    torch=torch,
+                )
+                print(
+                    f"Saved resumable checkpoint after epoch {epoch}: "
+                    f"{checkpoint_target}",
+                    flush=True,
+                )
+            if should_stop:
+                break
 
         if best_state is None:
             raise GNNTrainError("training produced no checkpoint")
@@ -330,15 +451,6 @@ def train_inductive_gnn(
             )
             test_auc = binary_auc(test_labels, test_scores)
 
-        output_dir = data_dir / "processed"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        artifact_prefixes = {
-            "prospective": "tekarx_inductive_gnn",
-            "prospective-no-dosage": "tekarx_no_dosage_inductive_gnn",
-            "completed_report": "tekarx_completed_report_inductive_gnn",
-        }
-        artifact_prefix = artifact_prefixes[feature_track]
-        model_path = output_dir / f"{artifact_prefix}.pt"
         temporary_model = model_path.with_suffix(".pt.tmp")
         torch.save(
             {
@@ -366,7 +478,6 @@ def train_inductive_gnn(
         )
         os.replace(temporary_model, model_path)
 
-        manifest_path = output_dir / f"{artifact_prefix}_manifest.json"
         record = GNNTrainRecord(
             model_path=str(model_path),
             manifest_path=str(manifest_path),
@@ -393,12 +504,18 @@ def train_inductive_gnn(
             evaluate_test=evaluate_test,
             feature_track=feature_track,
             edge_chunk_size=edge_chunk_size,
+            checkpoint_path=checkpoint_target,
+            resumed_from=resume_source,
+            checkpoint_every=checkpoint_every,
         )
-        print(f"Best validation AUC: {best_auc:.6f} (epoch {best_epoch})")
+        print(f"Best validation AUC: {best_auc:.6f} (epoch {best_epoch})", flush=True)
         if test_auc is None:
-            print("Test labels were not evaluated; the final test split remains untouched.")
+            print(
+                "Test labels were not evaluated; the final test split remains untouched.",
+                flush=True,
+            )
         else:
-            print(f"Explicit final test AUC: {test_auc:.6f}")
+            print(f"Explicit final test AUC: {test_auc:.6f}", flush=True)
         return record
     finally:
         if temporary_neighbor_path is not None:
@@ -406,6 +523,297 @@ def train_inductive_gnn(
             drug_neighbors = None
             gc.collect()
             temporary_neighbor_path.unlink(missing_ok=True)
+
+
+def _artifact_prefix(feature_track: str) -> str:
+    prefixes = {
+        "prospective": "tekarx_inductive_gnn",
+        "prospective-no-dosage": "tekarx_no_dosage_inductive_gnn",
+        "completed_report": "tekarx_completed_report_inductive_gnn",
+    }
+    return prefixes[feature_track]
+
+
+def _graph_fingerprint(graph_path: Path, graph: _TrainingGraph) -> str:
+    """Return a portable identity used to reject a checkpoint for another graph."""
+    digest = hashlib.sha256()
+    if graph.manifest is not None:
+        identity = {
+            "storage_backend": graph.storage_backend,
+            "patient_count": graph.patient_count,
+            "drug_count": graph.drug_count,
+            "edge_count": graph.edge_count,
+            "feature_names": graph.feature_names,
+            "manifest": graph.manifest,
+        }
+        digest.update(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        return digest.hexdigest()
+
+    with graph_path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_configuration(
+    *,
+    graph_fingerprint: str,
+    feature_track: str,
+    feature_names: tuple[str, ...],
+    batch_size: int,
+    hidden_channels: int,
+    dropout: float,
+    learning_rate: float,
+    weight_decay: float,
+    patience: int,
+    seed: int,
+    edge_chunk_size: int,
+    device_type: str,
+) -> dict[str, object]:
+    return {
+        "graph_fingerprint": graph_fingerprint,
+        "feature_track": feature_track,
+        "feature_names": list(feature_names),
+        "batch_size": batch_size,
+        "hidden_channels": hidden_channels,
+        "dropout": dropout,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "patience": patience,
+        "seed": seed,
+        "edge_chunk_size": edge_chunk_size,
+        "device_type": device_type,
+    }
+
+
+def _load_training_checkpoint(
+    path: Path,
+    *,
+    expected_configuration: dict[str, object],
+    maximum_epoch: int,
+    torch: object,
+) -> dict[str, object]:
+    if not path.is_file():
+        raise GNNTrainError(f"missing training checkpoint: {path}")
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise GNNTrainError(f"cannot load training checkpoint: {path}") from exc
+    if not isinstance(payload, dict):
+        raise GNNTrainError("training checkpoint must contain a mapping")
+    if payload.get("format") != GNN_CHECKPOINT_FORMAT:
+        raise GNNTrainError(
+            f"unsupported training checkpoint format: {payload.get('format')!r}"
+        )
+    if payload.get("format_version") != GNN_CHECKPOINT_VERSION:
+        raise GNNTrainError(
+            "unsupported training checkpoint version: "
+            f"{payload.get('format_version')!r}"
+        )
+    if payload.get("test_evaluated") is not False:
+        raise GNNTrainError("training checkpoint does not preserve the locked-test protocol")
+    actual_configuration = payload.get("configuration")
+    if actual_configuration != expected_configuration:
+        if isinstance(actual_configuration, dict):
+            changed = sorted(
+                key
+                for key in set(actual_configuration) | set(expected_configuration)
+                if actual_configuration.get(key) != expected_configuration.get(key)
+            )
+        else:
+            changed = ["configuration"]
+        raise GNNTrainError(
+            "training checkpoint is incompatible with this run; changed fields: "
+            + ", ".join(changed)
+        )
+
+    required = {
+        "completed_epoch",
+        "model_state_dict",
+        "optimizer_state_dict",
+        "best_state_dict",
+        "best_auc",
+        "best_epoch",
+        "stale_epochs",
+        "history",
+        "normalization",
+        "rng_state",
+    }
+    missing = required - set(payload)
+    if missing:
+        raise GNNTrainError(f"training checkpoint is missing fields: {sorted(missing)}")
+    completed_epoch = payload["completed_epoch"]
+    if not isinstance(completed_epoch, int) or completed_epoch < 1:
+        raise GNNTrainError("training checkpoint completed_epoch must be positive")
+    if completed_epoch > maximum_epoch:
+        raise GNNTrainError(
+            f"checkpoint is at epoch {completed_epoch}, beyond requested epoch {maximum_epoch}"
+        )
+    history = payload["history"]
+    if not isinstance(history, list) or len(history) != completed_epoch:
+        raise GNNTrainError("training checkpoint history does not match completed_epoch")
+    if any(
+        not isinstance(row, dict) or row.get("epoch") != index
+        for index, row in enumerate(history, start=1)
+    ):
+        raise GNNTrainError("training checkpoint history has invalid epoch ordering")
+    best_epoch = payload["best_epoch"]
+    if not isinstance(best_epoch, int) or not 1 <= best_epoch <= completed_epoch:
+        raise GNNTrainError("training checkpoint best_epoch is invalid")
+    stale_epochs = payload["stale_epochs"]
+    if not isinstance(stale_epochs, int) or stale_epochs < 0:
+        raise GNNTrainError("training checkpoint stale_epochs is invalid")
+    normalization = payload["normalization"]
+    if not isinstance(normalization, dict) or set(normalization) != {
+        "patient_mean",
+        "patient_std",
+        "neighbor_mean",
+        "neighbor_std",
+    }:
+        raise GNNTrainError("training checkpoint normalization state is invalid")
+    for name, value in normalization.items():
+        if not isinstance(value, torch.Tensor) or value.ndim != 1:
+            raise GNNTrainError(f"training checkpoint {name} must be a vector tensor")
+        if not bool(torch.isfinite(value).all()):
+            raise GNNTrainError(f"training checkpoint {name} contains NaN or infinity")
+    if not isinstance(payload["rng_state"], dict):
+        raise GNNTrainError("training checkpoint RNG state is invalid")
+    return payload
+
+
+def _write_training_checkpoint(
+    path: Path,
+    *,
+    configuration: dict[str, object],
+    completed_epoch: int,
+    model: object,
+    optimizer: object,
+    best_state: dict[str, object] | None,
+    best_auc: float,
+    best_epoch: int,
+    stale_epochs: int,
+    history: list[dict[str, float | int]],
+    patient_mean: object,
+    patient_std: object,
+    neighbor_mean: object,
+    neighbor_std: object,
+    training_device: object,
+    torch: object,
+) -> None:
+    if best_state is None:
+        raise GNNTrainError("cannot checkpoint training before a validation result exists")
+    payload = {
+        "format": GNN_CHECKPOINT_FORMAT,
+        "format_version": GNN_CHECKPOINT_VERSION,
+        "test_evaluated": False,
+        "configuration": copy.deepcopy(configuration),
+        "completed_epoch": completed_epoch,
+        "model_state_dict": _cpu_clone(model.state_dict(), torch=torch),
+        "optimizer_state_dict": _cpu_clone(optimizer.state_dict(), torch=torch),
+        "best_state_dict": _cpu_clone(best_state, torch=torch),
+        "best_auc": float(best_auc),
+        "best_epoch": best_epoch,
+        "stale_epochs": stale_epochs,
+        "history": copy.deepcopy(history),
+        "normalization": {
+            "patient_mean": _cpu_clone(patient_mean, torch=torch),
+            "patient_std": _cpu_clone(patient_std, torch=torch),
+            "neighbor_mean": _cpu_clone(neighbor_mean, torch=torch),
+            "neighbor_std": _cpu_clone(neighbor_std, torch=torch),
+        },
+        "rng_state": _capture_rng_state(training_device, torch=torch),
+    }
+    _atomic_torch_save(payload, path, torch=torch)
+
+
+def _atomic_torch_save(payload: object, path: Path, *, torch: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _cpu_clone(value: object, *, torch: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _cpu_clone(item, torch=torch) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_clone(item, torch=torch) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_clone(item, torch=torch) for item in value)
+    return copy.deepcopy(value)
+
+
+def _capture_rng_state(training_device: object, *, torch: object) -> dict[str, object]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state().cpu(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state(training_device).cpu()
+            if training_device.type == "cuda"
+            else None
+        ),
+    }
+
+
+def _restore_rng_state(
+    state: dict[str, object], training_device: object, *, torch: object
+) -> None:
+    required = {"python", "numpy", "torch_cpu", "torch_cuda"}
+    if set(state) != required:
+        raise GNNTrainError("training checkpoint RNG state has unexpected fields")
+    try:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"])
+        if training_device.type == "cuda":
+            cuda_state = state["torch_cuda"]
+            if not isinstance(cuda_state, torch.Tensor):
+                raise TypeError("missing CUDA RNG tensor")
+            torch.cuda.set_rng_state(cuda_state, training_device)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise GNNTrainError("training checkpoint RNG state cannot be restored") from exc
+
+
+def _optimizer_to_device(optimizer: object, device: object, *, torch: object) -> None:
+    for state in optimizer.state.values():
+        for name, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[name] = value.to(device)
+
+
+def _validate_normalization_dimensions(
+    *,
+    patient_mean: object,
+    patient_std: object,
+    neighbor_mean: object,
+    neighbor_std: object,
+    patient_channels: int,
+    drug_channels: int,
+    torch: object,
+) -> None:
+    expected = {
+        "patient_mean": (patient_mean, patient_channels),
+        "patient_std": (patient_std, patient_channels),
+        "neighbor_mean": (neighbor_mean, drug_channels),
+        "neighbor_std": (neighbor_std, drug_channels),
+    }
+    for name, (value, channels) in expected.items():
+        if not isinstance(value, torch.Tensor) or tuple(value.shape) != (channels,):
+            raise GNNTrainError(f"{name} does not match the selected graph features")
+    if bool(torch.any(patient_std <= 0)) or bool(torch.any(neighbor_std <= 0)):
+        raise GNNTrainError("normalization standard deviations must be positive")
 
 
 def _load_training_graph(
@@ -546,11 +954,13 @@ def _validate_memmap_training_graph(
             raise GNNTrainError("patient split ids must be 0, 1, or 2")
         for value in range(3):
             split_counts[value] += int(np.count_nonzero(local_split == value))
+    print(f"Validated {patient_count:,} patient rows.", flush=True)
     if any(count == 0 for count in split_counts):
         raise GNNTrainError("patient train, validation, and test splits must all be non-empty")
     for start in range(0, drug_shape[0], chunk_size):
         if not np.isfinite(np.asarray(drug_x[start : start + chunk_size])).all():
             raise GNNTrainError("graph drug features contain NaN or infinity")
+    print(f"Validated {drug_shape[0]:,} drug rows.", flush=True)
     for start in range(0, edge_count, chunk_size):
         stop = min(start + chunk_size, edge_count)
         patients = np.asarray(edge_patient_index[start:stop])
@@ -559,6 +969,7 @@ def _validate_memmap_training_graph(
             raise GNNTrainError("edge array contains an out-of-range patient node")
         if drugs.size and (drugs.min() < 0 or drugs.max() >= drug_shape[0]):
             raise GNNTrainError("edge array contains an out-of-range drug node")
+    print(f"Validated {edge_count:,} exposure edges.", flush=True)
 
 
 def aggregate_drug_neighbors(
@@ -651,9 +1062,15 @@ def _aggregate_drug_neighbors_memmap(
         shape=(patient_count, drug_channels),
     )
     output[:] = 0.0
+    output.flush()
+    print(
+        f"Initialized {patient_count:,} x {drug_channels:,} temporary neighbor matrix.",
+        flush=True,
+    )
     output_tensor = torch.from_numpy(output)
     degree = torch.zeros(patient_count, dtype=torch.float32)
     edge_count = int(edge_patient_index.shape[0])
+    reported_percent = 0
     for start in range(0, edge_count, edge_chunk_size):
         stop = min(start + edge_chunk_size, edge_count)
         patient_ids = torch.from_numpy(
@@ -677,7 +1094,14 @@ def _aggregate_drug_neighbors_memmap(
         degree.index_add_(
             0, patient_ids, torch.ones(patient_ids.numel(), dtype=torch.float32)
         )
+        reported_percent = _report_fractional_progress(
+            "Neighbor edge aggregation",
+            completed=stop,
+            total=edge_count,
+            reported_percent=reported_percent,
+        )
     orphan_count = 0
+    reported_percent = 0
     for start in range(0, patient_count, edge_chunk_size):
         stop = min(start + edge_chunk_size, patient_count)
         local_degree = degree[start:stop]
@@ -685,6 +1109,12 @@ def _aggregate_drug_neighbors_memmap(
         orphan_count += local_orphans
         if local_orphans == 0:
             output_tensor[start:stop].div_(local_degree.unsqueeze(1))
+        reported_percent = _report_fractional_progress(
+            "Neighbor mean normalization",
+            completed=stop,
+            total=patient_count,
+            reported_percent=reported_percent,
+        )
     if orphan_count:
         raise GNNTrainError(f"graph contains {orphan_count} patients without edges")
     output.flush()
@@ -694,6 +1124,19 @@ def _aggregate_drug_neighbors_memmap(
 
 def _matrix_shape(values: object) -> tuple[int, ...]:
     return tuple(int(value) for value in values.shape)
+
+
+def _report_fractional_progress(
+    label: str, *, completed: int, total: int, reported_percent: int
+) -> int:
+    if total <= 0:
+        return reported_percent
+    percentage = min(100, int(completed * 100 / total))
+    milestone = 100 if completed >= total else (percentage // 10) * 10
+    if milestone > reported_percent:
+        print(f"{label}: {completed:,}/{total:,} ({percentage}%)", flush=True)
+        return milestone
+    return reported_percent
 
 
 def _gather_matrix(
@@ -782,6 +1225,7 @@ def _chunked_train_standardization(
     feature_indices: list[int] | None,
     chunk_size: int,
     torch: object,
+    progress_label: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute stable train-only moments with O(chunk_size * features) memory."""
     row_count, feature_count = _matrix_shape(values)
@@ -789,15 +1233,18 @@ def _chunked_train_standardization(
     mean = torch.zeros(selected_count, dtype=torch.float64)
     second_moment = torch.zeros(selected_count, dtype=torch.float64)
     count = 0
-    for batch_ids in _iter_split_batches(
-        split_id,
-        split_value=0,
-        row_count=row_count,
-        scan_chunk_size=chunk_size,
-        batch_size=chunk_size,
-        shuffle=False,
-        generator=None,
-        torch=torch,
+    for batch_number, batch_ids in enumerate(
+        _iter_split_batches(
+            split_id,
+            split_value=0,
+            row_count=row_count,
+            scan_chunk_size=chunk_size,
+            batch_size=chunk_size,
+            shuffle=False,
+            generator=None,
+            torch=torch,
+        ),
+        start=1,
     ):
         batch = _gather_matrix(
             values, batch_ids, feature_indices=feature_indices, torch=torch
@@ -812,14 +1259,18 @@ def _chunked_train_standardization(
             mean = batch_mean
             second_moment = batch_second
             count = batch_count
-            continue
-        total = count + batch_count
-        delta = batch_mean - mean
-        second_moment += batch_second + delta.square() * count * batch_count / total
-        mean += delta * batch_count / total
-        count = total
+        else:
+            total = count + batch_count
+            delta = batch_mean - mean
+            second_moment += batch_second + delta.square() * count * batch_count / total
+            mean += delta * batch_count / total
+            count = total
+        if progress_label is not None and (batch_number == 1 or batch_number % 10 == 0):
+            print(f"{progress_label}: processed {count:,} training rows", flush=True)
     if count == 0:
         raise GNNTrainError("training split is empty")
+    if progress_label is not None:
+        print(f"{progress_label}: complete ({count:,} training rows)", flush=True)
     variance = (second_moment / count).clamp_min(0.0)
     std = variance.sqrt()
     std = torch.where(std > 1e-6, std, torch.ones_like(std))
@@ -1164,10 +1615,19 @@ def _validate_hyperparameters(
     learning_rate: float,
     patience: int,
     edge_chunk_size: int,
+    checkpoint_every: int,
 ) -> None:
-    if min(epochs, batch_size, hidden_channels, patience, edge_chunk_size) < 1:
+    if min(
+        epochs,
+        batch_size,
+        hidden_channels,
+        patience,
+        edge_chunk_size,
+        checkpoint_every,
+    ) < 1:
         raise ValueError(
-            "epochs, batch size, hidden size, patience, and chunk size must be positive"
+            "epochs, batch size, hidden size, patience, chunk size, and checkpoint "
+            "interval must be positive"
         )
     if not 0 <= dropout < 1:
         raise ValueError("dropout must be in [0, 1)")
@@ -1184,6 +1644,9 @@ def _write_manifest(
     evaluate_test: bool,
     feature_track: str,
     edge_chunk_size: int,
+    checkpoint_path: Path,
+    resumed_from: Path | None,
+    checkpoint_every: int,
 ) -> None:
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(
@@ -1226,6 +1689,14 @@ def _write_manifest(
                             "legacy compatibility keeps one aggregated neighbor matrix in RAM"
                         )
                     ),
+                },
+                "resumability": {
+                    "checkpoint_format": GNN_CHECKPOINT_FORMAT,
+                    "checkpoint_version": GNN_CHECKPOINT_VERSION,
+                    "checkpoint_path": str(checkpoint_path),
+                    "checkpoint_every_epochs": checkpoint_every,
+                    "resumed_from": str(resumed_from) if resumed_from is not None else None,
+                    "checkpoint_test_evaluated": False,
                 },
                 "record": asdict(record),
                 "history": history,

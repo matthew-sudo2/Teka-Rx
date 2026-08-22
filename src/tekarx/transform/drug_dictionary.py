@@ -72,8 +72,10 @@ def build_drug_dictionary(
         fuzzy_margin=fuzzy_margin,
     )
     if cached is not None:
+        print("Drug dictionary: verified cached artifact", flush=True)
         return cached
 
+    print("Drug dictionary [1/6]: extracting DrugCentral boxed-warning flags", flush=True)
     boxed_warning_path = _build_boxed_warning_flags(
         data_dir=data_dir,
         source=paths["drugcentral_dump"],
@@ -81,6 +83,7 @@ def build_drug_dictionary(
         memory_limit=memory_limit,
         threads=threads,
     )
+    print("Drug dictionary [2/6]: loading DrugCentral/RxNorm aliases", flush=True)
     aliases = _drugcentral_aliases(paths["structures"], paths["synonyms"])
     rxnorm_aliases = _rxnorm_aliases(paths.get("rxnorm_lookup"))
     atc_by_id = _atc_codes(paths["struct2atc"])
@@ -104,6 +107,7 @@ def build_drug_dictionary(
             memory_limit=memory_limit,
             threads=threads,
         )
+        print("Drug dictionary [3/6]: deduplicating retained FAERS exposures", flush=True)
         edges = _sql_literal(paths["drug_edges"].as_posix())
         cohort = _sql_literal(paths["cohort"].as_posix())
         connection.execute(
@@ -126,6 +130,7 @@ def build_drug_dictionary(
             else:
                 raw_to_prod_ai.setdefault(faers_raw, [])
         raw_names = list(raw_to_prod_ai)
+        print(f"Drug dictionary [4/6]: mapping {len(raw_names):,} unique FAERS names", flush=True)
         mappings, stats = _map_names(
             raw_to_prod_ai,
             aliases=aliases,
@@ -152,6 +157,7 @@ def build_drug_dictionary(
             }
         )
         connection.register("drug_mapping", mapping_table)
+        print("Drug dictionary [5/6]: calculating ingredient-level ROR", flush=True)
         connection.execute(
             """
             CREATE TABLE mapped_exposures AS
@@ -190,6 +196,7 @@ def build_drug_dictionary(
             """
         )
         destination = _sql_literal(temporary.as_posix())
+        print("Drug dictionary [6/6]: writing and auditing Snappy Parquet", flush=True)
         connection.execute(
             f"""
             COPY (
