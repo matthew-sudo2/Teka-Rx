@@ -16,7 +16,7 @@ import duckdb
 import pyarrow.parquet as pq
 
 from tekarx.extract.common import sha256_file
-from tekarx.studies import FAERS_PRESETS
+from tekarx.studies import FAERS_PRESETS, write_split_plan
 from tekarx.transform.duckdb_runtime import configure_duckdb
 
 SERIOUS_OUTCOME_CODES = ("DE", "LT", "HO", "DS", "RI", "CA", "OT")
@@ -79,6 +79,7 @@ def build_cohort(
         split_definition=split_definition,
     )
     if cached is not None:
+        write_split_plan(data_dir=data_dir, name=split_preset)
         return cached
 
     processed.mkdir(parents=True, exist_ok=True)
@@ -187,6 +188,7 @@ def build_cohort(
             quarter_coverage=quarter_coverage,
             memory_limit=memory_limit,
         )
+        write_split_plan(data_dir=data_dir, name=split_preset)
         return record
     except BaseException:
         if connection is not None:

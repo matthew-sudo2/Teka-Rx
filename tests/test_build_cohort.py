@@ -154,10 +154,17 @@ def test_build_cohort_keeps_latest_case_and_preserves_split_edges(tmp_path: Path
     _write_cohort_fixture(data_dir)
 
     first = build_cohort(data_dir=data_dir, memory_limit="512MB")
+    split_plan_path = data_dir / "processed" / "splits" / "faers_gnn-small.json"
+    assert split_plan_path.is_file()
+    split_plan_path.unlink()
     second = build_cohort(data_dir=data_dir, memory_limit="512MB")
 
     assert not first.cached
     assert second.cached
+    split_plan = json.loads(split_plan_path.read_text(encoding="utf-8"))
+    assert split_plan["preset"] == "gnn-small"
+    assert split_plan["group_key"] == "CASEID"
+    assert split_plan["splits"]["validation"] == ["2024Q1"]
     assert first.source_demo_rows == 10
     assert first.source_cases == 9
     assert first.deleted_cases == 1
