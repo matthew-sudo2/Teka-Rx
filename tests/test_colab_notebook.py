@@ -57,6 +57,7 @@ def test_colab_notebook_preserves_storage_and_leakage_protocol() -> None:
         "build-drug-dictionary",
         "add-tabular-features",
         "feature-rescue",
+        "write_split_plan",
         "--split-preset",
         "--skip-graph",
         "build-graph",
