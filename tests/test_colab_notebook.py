@@ -57,7 +57,7 @@ def test_colab_notebook_preserves_storage_and_leakage_protocol() -> None:
         "build-drug-dictionary",
         "add-tabular-features",
         "feature-rescue",
-        "write_split_plan",
+        "faers_gnn-full.json",
         "--split-preset",
         "--skip-graph",
         "build-graph",
@@ -81,6 +81,11 @@ def test_colab_notebook_preserves_storage_and_leakage_protocol() -> None:
     )
     for marker in required:
         assert marker in code
+
+    install_project = _cell_source(notebook, "install-project")
+    assert 'repo_source = str((REPO_DIR / "src").resolve())' in install_project
+    assert "sys.path.insert(0, repo_source)" in install_project
+    assert "import tekarx" in install_project
 
     forbidden = (
         "--evaluate-test",
