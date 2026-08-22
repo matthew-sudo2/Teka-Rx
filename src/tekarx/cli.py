@@ -181,6 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--xgb-max-depth", type=int, default=5)
     graph.add_argument("--xgb-max-leaves", type=int, default=0)
     graph.add_argument(
+        "--xgb-device",
+        choices=("auto", "cpu", "cuda"),
+        default="cpu",
+        help="XGBoost training device; auto uses CUDA only when both Torch and XGBoost support it",
+    )
+    graph.add_argument(
         "--graph-storage",
         choices=("memory-mapped", "legacy"),
         default="memory-mapped",
@@ -440,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
                 xgb_early_stopping=args.xgb_early_stopping,
                 xgb_max_depth=args.xgb_max_depth,
                 xgb_max_leaves=args.xgb_max_leaves,
+                xgb_device=args.xgb_device,
                 cohort_path=args.cohort_path,
                 storage_mode=args.graph_storage,
                 materialization_batch_size=args.materialization_batch_size,

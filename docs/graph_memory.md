@@ -99,6 +99,7 @@ tekarx build-graph `
   --graph-storage memory-mapped `
   --materialization-batch-size 131072 `
   --xgb-batch-size 65536 `
+  --xgb-device auto `
   --memory-limit 4GB `
   --threads 4
 ```
@@ -110,6 +111,11 @@ then 32,768 rows. `--xgb-batch-size` independently bounds the dense batches hand
 materialization estimate. Smaller batches reduce transient input memory roughly linearly at the
 cost of more batch overhead. Keep the arrays on a fast local SSD and allow enough free space for
 temporary and final artifacts during an atomic rebuild.
+
+`--xgb-device cuda` accelerates only histogram boosting and its evaluation. The DuckDB joins,
+Parquet scans, ordering, and NPY materialization that construct the graph remain CPU/SSD work.
+`--xgb-device auto` selects CUDA only when both PyTorch can see a GPU and the installed XGBoost
+wheel reports CUDA support. The command prints the resolved device before expensive graph work.
 
 For a tiny fixture or compatibility comparison, use:
 

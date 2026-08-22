@@ -143,8 +143,14 @@ tekarx build-graph
 For the final enriched model after `feature-rescue`, select its cohort explicitly:
 
 ```powershell
-tekarx build-graph --cohort-path data/processed/tekarx_cohort_feature_rescue.parquet
+tekarx build-graph `
+  --cohort-path data/processed/tekarx_cohort_feature_rescue.parquet `
+  --xgb-device auto
 ```
+
+CUDA accelerates the XGBoost baseline, while DuckDB graph preparation and memory-mapped array
+materialization remain CPU/SSD operations. The build prints elapsed-time heartbeats for blocking
+queries and row/round progress bars for streaming and boosting stages.
 
 On the tested Windows RTX 4050 environment, PyPI initially installed CPU-only Torch. Replace it
 with the official CUDA wheel before GNN training, then verify `torch.cuda.is_available()`:

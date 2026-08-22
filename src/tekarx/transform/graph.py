@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import threading
 import time
 from contextlib import contextmanager, suppress
@@ -108,6 +109,30 @@ class GraphBuildRecord:
     numeric_storage_bytes: int
     materialization_batch_size: int
     edge_index_dtype: str
+    xgboost_device: str
+
+
+def _resolve_xgb_device(xgb: Any, torch: Any, requested: str) -> str:
+    """Resolve an explicit or automatic XGBoost device before expensive graph work."""
+    normalized = str(requested).strip().lower()
+    if normalized not in {"auto", "cpu", "cuda"}:
+        raise ValueError("xgb_device must be 'auto', 'cpu', or 'cuda'")
+    xgboost_has_cuda = bool(xgb.build_info().get("USE_CUDA", False))
+    cuda_ready = xgboost_has_cuda and bool(torch.cuda.is_available())
+    if normalized == "auto":
+        resolved = "cuda" if cuda_ready else "cpu"
+        print(
+            f"XGBoost device auto-selection: {resolved} "
+            f"(torch_cuda={torch.cuda.is_available()}, xgboost_cuda={xgboost_has_cuda})",
+            flush=True,
+        )
+        return resolved
+    if normalized == "cuda" and not cuda_ready:
+        raise GraphBuildError(
+            "XGBoost CUDA was requested, but the runtime is not GPU-ready "
+            f"(torch_cuda={torch.cuda.is_available()}, xgboost_cuda={xgboost_has_cuda})"
+        )
+    return normalized
 
 
 def build_graph(
@@ -124,6 +149,7 @@ def build_graph(
     storage_mode: str = "memory-mapped",
     materialization_batch_size: int = 131_072,
     xgb_batch_size: int = 65_536,
+    xgb_device: str = "cpu",
 ) -> GraphBuildRecord:
     """Build the graph, tabular arrays, and a temporal XGBoost baseline.
 
@@ -148,6 +174,7 @@ def build_graph(
         raise GraphBuildError(
             'missing graph dependencies; install with python -m pip install -e ".[graph]"'
         ) from exc
+    resolved_xgb_device = _resolve_xgb_device(xgb, torch, xgb_device)
 
     paths = _required_paths(data_dir, cohort_path=cohort_path)
     cohort_columns = set(pq.ParquetFile(paths["cohort"]).schema_arrow.names)
@@ -295,7 +322,7 @@ def build_graph(
     )
     print(
         f"Graph [5/5]: training XGBoost for up to {xgb_rounds:,} rounds "
-        f"(early stopping={xgb_early_stopping})",
+        f"on {resolved_xgb_device} (early stopping={xgb_early_stopping})",
         flush=True,
     )
     round_progress = tqdm(
@@ -303,6 +330,7 @@ def build_graph(
         desc="  XGBoost rounds",
         unit="round",
         dynamic_ncols=True,
+        file=sys.stdout,
     )
 
     class RoundProgressCallback(xgb.callback.TrainingCallback):
@@ -320,6 +348,7 @@ def build_graph(
                 "objective": "binary:logistic",
                 "eval_metric": "auc",
                 "tree_method": "hist",
+                "device": resolved_xgb_device,
                 "max_depth": xgb_max_depth,
                 "max_leaves": xgb_max_leaves,
                 "grow_policy": "lossguide" if xgb_max_leaves else "depthwise",
@@ -363,6 +392,7 @@ def build_graph(
         numeric_storage_bytes=int(materialization["numeric_storage_bytes"]),
         materialization_batch_size=materialization_batch_size,
         edge_index_dtype=str(bundle.arrays["edge_patient_index"].dtype),
+        xgboost_device=resolved_xgb_device,
     )
     print(f"XGBoost validation AUC: {validation_auc:.6f}", flush=True)
     _write_manifest(
@@ -695,7 +725,7 @@ def _arrow_record_batch_reader(
 @contextmanager
 def _heartbeat_progress(description: str) -> Any:
     """Display elapsed time while a blocking native operation has no row-level progress."""
-    progress = tqdm(desc=description, unit="s", dynamic_ncols=True)
+    progress = tqdm(desc=description, unit="s", dynamic_ncols=True, file=sys.stdout)
     stopped = threading.Event()
 
     def heartbeat() -> None:
@@ -760,6 +790,7 @@ def _stream_feature_query(
         unit="rows",
         unit_scale=True,
         dynamic_ncols=True,
+        file=sys.stdout,
     ) as progress:
         for batch in reader:
             stop = offset + batch.num_rows
@@ -820,6 +851,7 @@ def _stream_scalar_query(
         unit="rows",
         unit_scale=True,
         dynamic_ncols=True,
+        file=sys.stdout,
     ) as progress:
         for batch in reader:
             stop = offset + batch.num_rows
@@ -985,6 +1017,7 @@ def _quantile_matrix_for_split(
                 unit="rows",
                 unit_scale=True,
                 dynamic_ncols=True,
+                file=sys.stdout,
             )
 
         def next(self, input_data: Any) -> int:

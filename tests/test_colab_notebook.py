@@ -63,6 +63,7 @@ def test_colab_notebook_preserves_storage_and_leakage_protocol() -> None:
         "build-graph",
         "--graph-storage",
         "memory-mapped",
+        "--xgb-device",
         "tekarx_graph_arrays",
         "graph_checkpoints",
         "gnn_checkpoints",

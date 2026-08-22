@@ -8,12 +8,55 @@ import pyarrow.parquet as pq
 import pytest
 
 from tekarx.transform.graph import (
+    GraphBuildError,
     _discover_patient_features,
     _patient_features,
     _prepare_graph_tables,
+    _resolve_xgb_device,
     binary_auc,
     build_graph,
 )
+
+
+class _FakeXGBoost:
+    def __init__(self, *, has_cuda: bool) -> None:
+        self.has_cuda = has_cuda
+
+    def build_info(self) -> dict[str, bool]:
+        return {"USE_CUDA": self.has_cuda}
+
+
+class _FakeTorchCuda:
+    def __init__(self, *, available: bool) -> None:
+        self.available = available
+
+    def is_available(self) -> bool:
+        return self.available
+
+
+class _FakeTorch:
+    def __init__(self, *, cuda_available: bool) -> None:
+        self.cuda = _FakeTorchCuda(available=cuda_available)
+
+
+def test_xgboost_device_resolution_fails_fast_before_graph_work() -> None:
+    assert _resolve_xgb_device(
+        _FakeXGBoost(has_cuda=True), _FakeTorch(cuda_available=True), "auto"
+    ) == "cuda"
+    assert _resolve_xgb_device(
+        _FakeXGBoost(has_cuda=True), _FakeTorch(cuda_available=False), "auto"
+    ) == "cpu"
+    with pytest.raises(GraphBuildError, match="runtime is not GPU-ready"):
+        _resolve_xgb_device(
+            _FakeXGBoost(has_cuda=False), _FakeTorch(cuda_available=True), "cuda"
+        )
+
+
+def test_build_graph_cli_accepts_gpu_xgboost() -> None:
+    from tekarx.cli import build_parser
+
+    args = build_parser().parse_args(["build-graph", "--xgb-device", "cuda"])
+    assert args.xgb_device == "cuda"
 
 
 def _write(path: Path, rows: list[dict[str, object]]) -> None:
