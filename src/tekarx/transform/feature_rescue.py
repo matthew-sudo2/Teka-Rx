@@ -12,6 +12,7 @@ import duckdb
 import pyarrow.parquet as pq
 
 from tekarx.extract.common import sha256_file
+from tekarx.transform.duckdb_runtime import configure_duckdb
 from tekarx.transform.graph import GraphBuildRecord, build_graph
 
 INDICATION_HASH_BINS = 32
@@ -99,11 +100,13 @@ def build_feature_rescue(
     connection: duckdb.DuckDBPyConnection | None = None
     try:
         connection = duckdb.connect(str(database))
-        connection.execute(f"SET memory_limit = '{_sql_literal(memory_limit)}'")
-        if threads is not None:
-            if threads < 1:
-                raise ValueError("threads must be positive")
-            connection.execute(f"SET threads = {threads}")
+        configure_duckdb(
+            connection,
+            data_dir=data_dir,
+            stage="feature-rescue",
+            memory_limit=memory_limit,
+            threads=threads,
+        )
         coverage = _build_rescue_tables(
             connection,
             base=base,

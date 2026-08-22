@@ -94,8 +94,15 @@ then its cohort and features are validated and checkpointed. The graph is built 
 storage          memory-mapped
 Arrow batch      131,072 rows
 XGBoost batch     65,536 rows
-DuckDB memory          4 GB
+DuckDB memory          6 GB
+DuckDB threads             1
 ```
+
+On a standard Colab runtime with about 12.7 GiB of system RAM, the notebook caps DuckDB at
+6 GB, uses one worker thread, disables insertion-order preservation, and spills oversized
+intermediates to `/content/tekarx-data/interim/.duckdb_temp/`. The remaining memory is reserved
+for Python, Arrow, the operating system, and filesystem cache. Do not raise this above 7 GB on
+that runtime; use a high-memory runtime if one query still cannot complete with spilling enabled.
 
 The graph audit requires:
 

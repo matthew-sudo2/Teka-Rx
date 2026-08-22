@@ -51,25 +51,30 @@ def build_prospective_pipeline(
         raise ValueError("threads must be at least 1")
     _validate_prerequisites(root, split_preset=split_preset)
 
+    print("[1/4] Building leakage-safe cohort...", flush=True)
     cohort_record = build_cohort(
         data_dir=root,
         split_preset=split_preset,
         memory_limit=memory_limit,
         threads=threads,
     )
+    print("[2/4] Building drug dictionary...", flush=True)
     dictionary_record = build_drug_dictionary(
         data_dir=root,
         fuzzy_trigger_rate=fuzzy_trigger_rate,
         fuzzy_score_cutoff=fuzzy_score_cutoff,
         fuzzy_margin=fuzzy_margin,
         memory_limit=memory_limit,
+        threads=threads,
     )
+    print("[3/4] Building prospective tabular features...", flush=True)
     feature_record = add_tabular_features(
         data_dir=root,
         memory_limit=memory_limit,
         threads=threads,
         rebuild_graph=False,
     )
+    print("[4/4] Building train-frozen rescue features...", flush=True)
     rescue_record = build_feature_rescue(
         data_dir=root,
         memory_limit=memory_limit,

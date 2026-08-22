@@ -140,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     dictionary.add_argument("--fuzzy-score-cutoff", type=float, default=97.0)
     dictionary.add_argument("--fuzzy-margin", type=float, default=3.0)
     dictionary.add_argument("--memory-limit", default="4GB")
+    dictionary.add_argument("--threads", type=int, help="optional DuckDB worker-thread limit")
 
     rxnorm = subparsers.add_parser(
         "build-rxnorm-lookup",
@@ -391,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
                 fuzzy_score_cutoff=args.fuzzy_score_cutoff,
                 fuzzy_margin=args.fuzzy_margin,
                 memory_limit=args.memory_limit,
+                threads=args.threads,
             )
             print(json.dumps(asdict(dictionary_record), indent=2, sort_keys=True))
             return 0

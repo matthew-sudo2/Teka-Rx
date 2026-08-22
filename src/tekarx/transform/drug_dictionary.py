@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 
 from tekarx.extract.common import sha256_file
 from tekarx.transform.drugcentral import _COPY_RE, _identifier, _unescape_copy
+from tekarx.transform.duckdb_runtime import configure_duckdb
 
 DRUG_DICTIONARY_BUILD_VERSION = 4
 BOXED_WARNING_LOINC = "34066-1"
@@ -54,6 +55,7 @@ def build_drug_dictionary(
     fuzzy_score_cutoff: float = 97.0,
     fuzzy_margin: float = 3.0,
     memory_limit: str = "4GB",
+    threads: int | None = None,
 ) -> DrugDictionaryBuildRecord:
     """Create one raw-name linkage row with ingredient-level ROR per FAERS drug."""
     _validate_thresholds(fuzzy_trigger_rate, fuzzy_score_cutoff, fuzzy_margin)
@@ -77,6 +79,7 @@ def build_drug_dictionary(
         source=paths["drugcentral_dump"],
         source_sha256=source_checksums[str(paths["drugcentral_dump"])],
         memory_limit=memory_limit,
+        threads=threads,
     )
     aliases = _drugcentral_aliases(paths["structures"], paths["synonyms"])
     rxnorm_aliases = _rxnorm_aliases(paths.get("rxnorm_lookup"))
@@ -94,7 +97,13 @@ def build_drug_dictionary(
     connection: duckdb.DuckDBPyConnection | None = None
     try:
         connection = duckdb.connect(str(database))
-        connection.execute(f"SET memory_limit = '{_sql_literal(memory_limit)}'")
+        configure_duckdb(
+            connection,
+            data_dir=data_dir,
+            stage="drug-dictionary",
+            memory_limit=memory_limit,
+            threads=threads,
+        )
         edges = _sql_literal(paths["drug_edges"].as_posix())
         cohort = _sql_literal(paths["cohort"].as_posix())
         connection.execute(
@@ -498,7 +507,12 @@ def _single_id(values: object) -> int:
 
 
 def _build_boxed_warning_flags(
-    *, data_dir: Path, source: Path, source_sha256: str, memory_limit: str
+    *,
+    data_dir: Path,
+    source: Path,
+    source_sha256: str,
+    memory_limit: str,
+    threads: int | None,
 ) -> Path:
     output_dir = data_dir / "interim" / "drugcentral"
     destination = output_dir / "boxed_warning.parquet"
@@ -522,7 +536,13 @@ def _build_boxed_warning_flags(
     temporary.unlink(missing_ok=True)
     connection = duckdb.connect()
     try:
-        connection.execute(f"SET memory_limit = '{_sql_literal(memory_limit)}'")
+        configure_duckdb(
+            connection,
+            data_dir=data_dir,
+            stage="boxed-warning",
+            memory_limit=memory_limit,
+            threads=threads,
+        )
         active = _sql_literal(projected["active_ingredient"].as_posix())
         labels = _sql_literal(projected["prd2label"].as_posix())
         sections = _sql_literal(projected["section"].as_posix())

@@ -23,6 +23,7 @@ from tekarx.transform.dosage import (
     normalized_frequency_sql,
     normalized_unit_sql,
 )
+from tekarx.transform.duckdb_runtime import configure_duckdb
 from tekarx.transform.graph import GraphBuildRecord, build_graph
 
 ATC_INITIALS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -88,11 +89,13 @@ def add_tabular_features(
     connection: duckdb.DuckDBPyConnection | None = None
     try:
         connection = duckdb.connect(str(database))
-        connection.execute(f"SET memory_limit = '{_sql_literal(memory_limit)}'")
-        if threads is not None:
-            if threads < 1:
-                raise ValueError("threads must be positive")
-            connection.execute(f"SET threads = {threads}")
+        configure_duckdb(
+            connection,
+            data_dir=data_dir,
+            stage="tabular-features",
+            memory_limit=memory_limit,
+            threads=threads,
+        )
         _validate_input_columns(cohort=cohort, report_drug=report_drug)
         _build_feature_tables(
             connection,

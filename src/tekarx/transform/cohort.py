@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 
 from tekarx.extract.common import sha256_file
 from tekarx.studies import FAERS_PRESETS
+from tekarx.transform.duckdb_runtime import configure_duckdb
 
 SERIOUS_OUTCOME_CODES = ("DE", "LT", "HO", "DS", "RI", "CA", "OT")
 COHORT_BUILD_VERSION = 2
@@ -87,14 +88,13 @@ def build_cohort(
     connection: duckdb.DuckDBPyConnection | None = None
     try:
         connection = duckdb.connect(str(database))
-        connection.execute(f"SET memory_limit = '{_sql_literal(memory_limit)}'")
-        if threads is not None:
-            if threads < 1:
-                raise ValueError("threads must be at least 1")
-            connection.execute(f"SET threads = {threads}")
-        temp_directory = data_dir / "interim" / ".duckdb_temp"
-        temp_directory.mkdir(parents=True, exist_ok=True)
-        connection.execute(f"SET temp_directory = '{_sql_literal(temp_directory.as_posix())}'")
+        configure_duckdb(
+            connection,
+            data_dir=data_dir,
+            stage="cohort",
+            memory_limit=memory_limit,
+            threads=threads,
+        )
 
         _create_source_views(connection, data_dir)
         _create_case_tables(connection, split_definition)

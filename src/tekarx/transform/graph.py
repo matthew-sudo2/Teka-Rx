@@ -16,6 +16,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from tekarx.transform.dosage import DOSAGE_PATIENT_FEATURES
+from tekarx.transform.duckdb_runtime import configure_duckdb
 from tekarx.transform.graph_storage import (
     MEMMAP_GRAPH_FORMAT,
     MEMMAP_GRAPH_VERSION,
@@ -182,11 +183,13 @@ def build_graph(
     materialization: dict[str, Any] | None = None
     try:
         connection = duckdb.connect(str(database))
-        connection.execute(f"SET memory_limit = '{_sql_literal(memory_limit)}'")
-        if threads is not None:
-            if threads < 1:
-                raise ValueError("threads must be positive")
-            connection.execute(f"SET threads = {threads}")
+        configure_duckdb(
+            connection,
+            data_dir=data_dir,
+            stage="graph",
+            memory_limit=memory_limit,
+            threads=threads,
+        )
         _prepare_graph_tables(
             connection,
             paths=paths,

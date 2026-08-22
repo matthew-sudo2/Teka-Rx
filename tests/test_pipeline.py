@@ -66,6 +66,7 @@ def test_build_prospective_pipeline_runs_stages_in_order_and_returns_json_ready_
 
     assert [stage for stage, _ in calls] == ["cohort", "dictionary", "features", "rescue"]
     assert calls[0][1]["split_preset"] == "gnn-full"
+    assert calls[1][1]["threads"] == 2
     assert calls[2][1]["rebuild_graph"] is False
     assert calls[3][1]["rebuild_graph"] is True
     payload = asdict(record)
