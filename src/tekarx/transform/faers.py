@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -17,6 +18,7 @@ from tekarx.extract.common import sha256_file
 
 CORE_FAERS_TABLES = ("demo", "drug", "indi", "reac", "outc", "delete")
 CSV_BLOCK_SIZE = 16 * 1024 * 1024
+DELETE_BATCH_ROWS = 100_000
 
 
 class FaersBuildError(RuntimeError):
@@ -53,6 +55,9 @@ def build_faers(
 
 
 def _build_table(*, data_dir: Path, quarter: str, table: str) -> ParquetBuildRecord:
+    if table == "delete":
+        return _build_delete_table(data_dir=data_dir, quarter=quarter)
+
     source = _find_source_file(data_dir=data_dir, quarter=quarter, table=table)
     checksum = sha256_file(source)
     destination = data_dir / "interim" / "faers" / table / f"{quarter}.parquet"
@@ -99,13 +104,61 @@ def _build_table(*, data_dir: Path, quarter: str, table: str) -> ParquetBuildRec
     )
 
 
-def _find_source_file(*, data_dir: Path, quarter: str, table: str) -> Path:
+def _build_delete_table(*, data_dir: Path, quarter: str) -> ParquetBuildRecord:
+    sources = _find_delete_source_files(data_dir=data_dir, quarter=quarter)
+    source_entries = [
+        {
+            "path": source.relative_to(data_dir).as_posix(),
+            "sha256": sha256_file(source),
+        }
+        for source in sources
+    ]
+    source_reference = json.dumps(source_entries, sort_keys=True, separators=(",", ":"))
+    source_sha256 = hashlib.sha256(source_reference.encode()).hexdigest()
+    destination = data_dir / "interim" / "faers" / "delete" / f"{quarter}.parquet"
+    cached = _cached_record(
+        destination=destination,
+        source=source_reference,
+        source_sha256=source_sha256,
+        quarter=quarter,
+        table="delete",
+    )
+    if cached is not None:
+        return cached
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    rows, columns = _convert_delete_sources(
+        sources=sources,
+        destination=destination,
+        source_reference=source_reference,
+        source_sha256=source_sha256,
+        quarter=quarter,
+    )
+    return ParquetBuildRecord(
+        quarter=quarter,
+        table="delete",
+        source_path=source_reference,
+        source_sha256=source_sha256,
+        output_path=str(destination),
+        rows=rows,
+        columns=columns,
+        output_size_bytes=destination.stat().st_size,
+        compression="snappy",
+    )
+
+
+def _extracted_root(*, data_dir: Path, quarter: str) -> Path:
     extracted = data_dir / "raw" / "faers" / quarter / "extracted"
     if not (extracted / ".complete").is_file():
         raise FaersBuildError(
             f"FAERS {quarter} is not completely extracted; run "
             f"`tekarx extract-faers --quarter {quarter}` first"
         )
+    return extracted
+
+
+def _find_source_file(*, data_dir: Path, quarter: str, table: str) -> Path:
+    extracted = _extracted_root(data_dir=data_dir, quarter=quarter)
     prefix = table.upper()
     matches = sorted(
         path
@@ -115,6 +168,23 @@ def _find_source_file(*, data_dir: Path, quarter: str, table: str) -> Path:
     if len(matches) != 1:
         raise FaersBuildError(f"expected one {prefix} TXT file for {quarter}, found {len(matches)}")
     return matches[0]
+
+
+def _find_delete_source_files(*, data_dir: Path, quarter: str) -> list[Path]:
+    extracted = _extracted_root(data_dir=data_dir, quarter=quarter)
+    matches = sorted(
+        path
+        for path in extracted.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() == ".txt"
+        and (
+            path.stem.upper().startswith("DELETE")
+            or "DELETEDCASE" in path.stem.upper()
+        )
+    )
+    if not matches:
+        raise FaersBuildError(f"expected deletion-case TXT files for {quarter}, found 0")
+    return matches
 
 
 def _convert_source(
@@ -182,6 +252,94 @@ def _convert_source(
     return rows, len(output_schema)
 
 
+def _convert_delete_sources(
+    *,
+    sources: list[Path],
+    destination: Path,
+    source_reference: str,
+    source_sha256: str,
+    quarter: str,
+) -> tuple[int, int]:
+    metadata = {
+        b"tekarx.source_path": source_reference.encode(),
+        b"tekarx.source_sha256": source_sha256.encode(),
+        b"tekarx.quarter": quarter.encode(),
+        b"tekarx.table": b"delete",
+        b"tekarx.encoding": b"ASCII numeric case identifiers",
+        b"tekarx.built_at_utc": datetime.now(UTC).isoformat().encode(),
+    }
+    output_schema = pa.schema(
+        [
+            pa.field("caseid", pa.string()),
+            pa.field("quarter", pa.string(), nullable=False),
+        ],
+        metadata=metadata,
+    )
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+    writer: pq.ParquetWriter | None = None
+    rows = 0
+    identifiers: list[str] = []
+    progress = tqdm(desc=f"Building {quarter} delete", unit="rows", unit_scale=True)
+    try:
+        writer = pq.ParquetWriter(temporary, output_schema, compression="snappy")
+        for source in sources:
+            with source.open("rb") as stream:
+                for line in stream:
+                    for field in line.split(b"$"):
+                        token = field.strip().lstrip(b"\xef\xbb\xbf")
+                        if token.isdigit():
+                            identifiers.append(token.decode("ascii"))
+                    if len(identifiers) >= DELETE_BATCH_ROWS:
+                        rows += _write_delete_batch(
+                            writer,
+                            identifiers=identifiers,
+                            quarter=quarter,
+                            schema=output_schema,
+                        )
+                        progress.update(len(identifiers))
+                        identifiers.clear()
+        if identifiers:
+            rows += _write_delete_batch(
+                writer,
+                identifiers=identifiers,
+                quarter=quarter,
+                schema=output_schema,
+            )
+            progress.update(len(identifiers))
+            identifiers.clear()
+        writer.close()
+        writer = None
+        _verify_parquet(temporary, expected_rows=rows, expected_schema=output_schema)
+        os.replace(temporary, destination)
+    except BaseException:
+        if writer is not None:
+            writer.close()
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        progress.close()
+    return rows, len(output_schema)
+
+
+def _write_delete_batch(
+    writer: pq.ParquetWriter,
+    *,
+    identifiers: list[str],
+    quarter: str,
+    schema: pa.Schema,
+) -> int:
+    batch = pa.RecordBatch.from_arrays(
+        [
+            pa.array(identifiers, type=pa.string()),
+            pa.array([quarter] * len(identifiers), type=pa.string()),
+        ],
+        schema=schema.remove_metadata(),
+    )
+    writer.write_batch(batch)
+    return len(identifiers)
+
+
 def _source_layout(source: Path, *, table: str) -> tuple[list[str], int]:
     with source.open("rb") as stream:
         header = stream.readline().decode("utf-8-sig").rstrip("\r\n")
@@ -212,7 +370,7 @@ def _verify_parquet(path: Path, *, expected_rows: int, expected_schema: pa.Schem
 def _cached_record(
     *,
     destination: Path,
-    source: Path,
+    source: Path | str,
     source_sha256: str,
     quarter: str,
     table: str,

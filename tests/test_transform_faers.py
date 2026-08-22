@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pyarrow as pa
@@ -68,3 +69,36 @@ def test_build_faers_streams_core_tables_to_snappy_parquet(tmp_path: Path) -> No
     assert deleted.column_names == ["caseid", "quarter"]
     assert deleted["caseid"].to_pylist() == ["999"]
     assert (data_dir / "interim" / "faers" / "manifest.json").is_file()
+
+
+def test_build_faers_combines_historical_deletion_file_names(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    extracted = data_dir / "raw" / "faers" / "2019Q1" / "extracted"
+    deleted_dir = extracted / "Deleted"
+    deleted_dir.mkdir(parents=True)
+    (extracted / ".complete").write_text("verified extraction\n", encoding="utf-8")
+    (deleted_dir / "ADR19Q1DeletedCases.txt").write_text(
+        "caseid\n10417202\n999$\n", encoding="utf-8"
+    )
+    (deleted_dir / "AllDeletedCases.txt").write_text(
+        "\n820242\n10417202\n", encoding="utf-8"
+    )
+    (deleted_dir / "README.txt").write_text(
+        "Deletion file documentation for 2019.\n", encoding="utf-8"
+    )
+
+    first = build_faers(data_dir=data_dir, quarters=["2019Q1"], tables=("delete",))
+    second = build_faers(data_dir=data_dir, quarters=["2019Q1"], tables=("delete",))
+
+    assert len(first) == 1
+    assert first[0].cached is False
+    assert second[0].cached is True
+    deleted_path = data_dir / "interim" / "faers" / "delete" / "2019Q1.parquet"
+    deleted = pq.read_table(deleted_path)
+    assert deleted["caseid"].to_pylist() == ["10417202", "999", "820242", "10417202"]
+    metadata = deleted.schema.metadata or {}
+    sources = json.loads(metadata[b"tekarx.source_path"])
+    assert [Path(item["path"]).name for item in sources] == [
+        "ADR19Q1DeletedCases.txt",
+        "AllDeletedCases.txt",
+    ]

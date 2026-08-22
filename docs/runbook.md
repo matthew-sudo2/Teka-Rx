@@ -144,6 +144,10 @@ data/interim/faers/
 All source fields remain strings during this lossless staging step. Each output adds a
 `quarter` column, uses Snappy compression, and embeds the source SHA-256 checksum in Parquet
 metadata. A rerun reuses an output only when the current raw TXT checksum matches.
+Deletion filenames vary by quarter. When an archive contains multiple deletion-case TXT files
+(including the cumulative and incremental files in 2019Q1), the builder streams all numeric
+case IDs into the quarter's DELETE Parquet and records every source path and checksum in its
+provenance metadata.
 
 ## 5. Build the report cohort and graph edges
 
