@@ -48,6 +48,7 @@ def _write_cohort_fixture(data_dir: Path) -> None:
     ]:
         drug_rows.append(_drug(primaryid, caseid, "1", f"Drug {primaryid}", quarter))
     drug_rows.append(_drug("1002", "100", "2", "Second Drug", "2023Q4"))
+    drug_rows.append(_drug("1002", "100", "2", "Second Drug", "2023Q4"))
     _write_table(root / "drug" / "fixture.parquet", drug_rows)
 
     report_quarters = {row["primaryid"]: row["quarter"] for row in demo_rows}
@@ -68,6 +69,7 @@ def _write_cohort_fixture(data_dir: Path) -> None:
             ("5001", "500"),
         ]
     ]
+    reaction_rows.append(reaction_rows[1].copy())
     _write_table(root / "reac" / "fixture.parquet", reaction_rows)
 
     outcome_rows = []
@@ -93,6 +95,7 @@ def _write_cohort_fixture(data_dir: Path) -> None:
                     "quarter": report_quarters[primaryid],
                 }
             )
+    outcome_rows.append(outcome_rows[2].copy())
     _write_table(root / "outc" / "fixture.parquet", outcome_rows)
     _write_table(
         root / "delete" / "fixture.parquet",
@@ -190,6 +193,10 @@ def test_build_cohort_keeps_latest_case_and_preserves_split_edges(tmp_path: Path
     assert set(indexed.loc[["1002", "4001", "5001", "8001"], "split"]) == {"train"}
 
     drug_edges = pq.read_table(data_dir / "processed" / "edges" / "report_drug.parquet")
+    assert first.drug_edges == 7
+    assert first.reaction_edges == 5
+    assert first.outcome_edges == 7
+    assert drug_edges.num_rows == 7
     assert "1001" not in drug_edges["primaryid"].to_pylist()
     assert set(drug_edges["primaryid"].to_pylist()) == set(cohort["primaryid"])
     case_splits = pq.read_table(data_dir / "processed" / "case_splits.parquet").to_pandas()

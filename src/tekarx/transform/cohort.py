@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
+import tempfile
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,7 +20,8 @@ from tekarx.studies import FAERS_PRESETS
 from tekarx.transform.duckdb_runtime import configure_duckdb
 
 SERIOUS_OUTCOME_CODES = ("DE", "LT", "HO", "DS", "RI", "CA", "OT")
-COHORT_BUILD_VERSION = 2
+COHORT_BUILD_VERSION = 3
+COHORT_AGGREGATE_BUCKETS = 64
 
 
 class CohortBuildError(RuntimeError):
@@ -85,6 +89,7 @@ def build_cohort(
 
     database = data_dir / "interim" / f".cohort-build-{os.getpid()}.duckdb"
     database.unlink(missing_ok=True)
+    aggregation_root: Path | None = None
     connection: duckdb.DuckDBPyConnection | None = None
     try:
         connection = duckdb.connect(str(database))
@@ -96,11 +101,30 @@ def build_cohort(
             threads=threads,
         )
 
+        print("Cohort [1/5]: registering FAERS Parquet sources", flush=True)
         _create_source_views(connection, data_dir)
+        print("Cohort [2/5]: selecting the latest version of each case", flush=True)
         _create_case_tables(connection, split_definition)
-        _create_aggregates(connection)
+        aggregation_root = Path(
+            tempfile.mkdtemp(prefix=".cohort-aggregate-", dir=data_dir / "interim")
+        )
+        print(
+            f"Cohort [3/5]: aggregating drugs, reactions, and outcomes in "
+            f"{COHORT_AGGREGATE_BUCKETS} disk-backed buckets",
+            flush=True,
+        )
+        _create_aggregates(
+            connection,
+            work_dir=aggregation_root,
+            buckets=COHORT_AGGREGATE_BUCKETS,
+        )
+        print("Cohort [4/5]: assembling the patient cohort and edge tables", flush=True)
         _create_cohort_table(connection)
-        _create_edge_tables(connection)
+        _create_edge_tables(
+            connection,
+            work_dir=aggregation_root,
+            buckets=COHORT_AGGREGATE_BUCKETS,
+        )
 
         table_names = {
             "cohort": "cohort_final",
@@ -109,7 +133,9 @@ def build_cohort(
             "reaction_edges": "report_reaction_edges",
             "outcome_edges": "report_outcome_edges",
         }
+        print("Cohort [5/5]: writing and auditing Snappy Parquet outputs", flush=True)
         for name, table in table_names.items():
+            print(f"  Writing {name}...", flush=True)
             _copy_parquet(connection, table=table, destination=temporary_outputs[name])
 
         stats = _audit_tables(connection)
@@ -170,6 +196,8 @@ def build_cohort(
         raise
     finally:
         database.unlink(missing_ok=True)
+        if aggregation_root is not None:
+            shutil.rmtree(aggregation_root, ignore_errors=True)
 
 
 def _split_definition(split_preset: str) -> dict[str, tuple[str, ...]]:
@@ -263,14 +291,19 @@ def _create_case_tables(
 ) -> None:
     report_date = _report_date_sql()
     age_years = _age_years_sql()
-    connection.execute(
+    _execute_timed(
+        connection,
+        "indexing deleted cases",
         "CREATE TABLE deleted_cases AS "
-        "SELECT DISTINCT caseid FROM delete_source WHERE caseid IS NOT NULL"
+        "SELECT DISTINCT caseid FROM delete_source WHERE caseid IS NOT NULL",
     )
-    connection.execute(
+    _execute_timed(
+        connection,
+        "projecting normalized demographics",
         f"""
         CREATE TABLE demo_clean AS
-        SELECT d.*, {report_date} AS report_date,
+        SELECT d.primaryid, d.caseid, d.quarter, d.sex, d.wt, d.wt_cod,
+               {report_date} AS report_date,
                try_cast(d.caseversion AS BIGINT) AS caseversion_num,
                {age_years} AS age_years
         FROM demo_source d
@@ -279,15 +312,7 @@ def _create_case_tables(
           AND NOT EXISTS (
               SELECT 1 FROM deleted_cases x WHERE x.caseid = d.caseid
           )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE case_dates AS
-        SELECT caseid, max(report_date) AS max_report_date
-        FROM demo_clean
-        GROUP BY caseid
-        """
+        """,
     )
     split_rows = ", ".join(
         f"('{_sql_literal(quarter)}', '{_sql_literal(split)}')"
@@ -296,7 +321,9 @@ def _create_case_tables(
     )
     connection.execute("CREATE TEMP TABLE split_quarters(quarter VARCHAR, split VARCHAR)")
     connection.execute(f"INSERT INTO split_quarters VALUES {split_rows}")
-    connection.execute(
+    _execute_timed(
+        connection,
+        "ranking latest case versions",
         """
         CREATE TABLE latest_demo_all AS
         WITH ranked AS (
@@ -313,76 +340,170 @@ def _create_case_tables(
                report_date, upper(trim(quarter)) AS quarter, age_years, sex, wt, wt_cod
         FROM ranked
         WHERE version_rank = 1
-        """
+        """,
     )
-    connection.execute(
+    _execute_timed(
+        connection,
+        "assigning temporal splits",
         """
         CREATE TABLE case_splits AS
         SELECT l.caseid, l.report_date AS max_report_date, l.quarter, q.split
         FROM latest_demo_all l
         JOIN split_quarters q USING (quarter)
-        """
+        """,
     )
-    connection.execute(
+    _execute_timed(
+        connection,
+        "filtering invalid ages",
         "CREATE TABLE latest_demo_age_valid AS SELECT * FROM latest_demo_all "
-        "WHERE age_years IS NULL OR age_years BETWEEN 0 AND 120"
+        "WHERE age_years IS NULL OR age_years BETWEEN 0 AND 120",
     )
-    connection.execute(
+    _execute_timed(
+        connection,
+        "restricting reports to the split plan",
         "CREATE TABLE latest_demo AS "
-        "SELECT l.* FROM latest_demo_age_valid l JOIN case_splits s USING (caseid)"
+        "SELECT l.* FROM latest_demo_age_valid l JOIN case_splits s USING (caseid)",
     )
 
 
-def _create_aggregates(connection: duckdb.DuckDBPyConnection) -> None:
-    connection.execute(
-        """
-        CREATE TABLE drug_agg AS
-        WITH cleaned AS (
-            SELECT d.primaryid, upper(trim(d.drugname)) AS drugname
+def _execute_timed(
+    connection: duckdb.DuckDBPyConnection, label: str, sql: str
+) -> duckdb.DuckDBPyConnection:
+    started = time.monotonic()
+    print(f"  {label}...", flush=True)
+    result = connection.execute(sql)
+    print(f"  {label}: complete in {time.monotonic() - started:.1f}s", flush=True)
+    return result
+
+
+def _create_aggregates(
+    connection: duckdb.DuckDBPyConnection, *, work_dir: Path, buckets: int
+) -> None:
+    _create_bucketed_aggregate(
+        connection,
+        work_dir=work_dir,
+        buckets=buckets,
+        name="drug",
+        source_sql="""
+            SELECT d.primaryid, upper(trim(d.drugname)) AS value
             FROM drug_source d
             JOIN latest_demo l USING (primaryid)
             WHERE d.drugname IS NOT NULL AND trim(d.drugname) <> ''
-        )
-        SELECT primaryid,
-               string_agg(DISTINCT drugname, '|' ORDER BY drugname) AS drug_list_str,
-               count(DISTINCT drugname)::INTEGER AS num_drugs
-        FROM cleaned
-        GROUP BY primaryid
-        """
+        """,
+        aggregate_columns="""
+            string_agg(DISTINCT value, '|' ORDER BY value) AS drug_list_str,
+            count(DISTINCT value)::INTEGER AS num_drugs
+        """,
+        empty_columns="primaryid VARCHAR, drug_list_str VARCHAR, num_drugs INTEGER",
     )
-    connection.execute(
-        """
-        CREATE TABLE reaction_agg AS
-        WITH cleaned AS (
-            SELECT r.primaryid, trim(r.pt) AS reaction
+    _create_bucketed_aggregate(
+        connection,
+        work_dir=work_dir,
+        buckets=buckets,
+        name="reaction",
+        source_sql="""
+            SELECT r.primaryid, trim(r.pt) AS value
             FROM reac_source r
             JOIN latest_demo l USING (primaryid)
             WHERE r.pt IS NOT NULL AND trim(r.pt) <> ''
-        )
-        SELECT primaryid,
-               string_agg(DISTINCT reaction, '|' ORDER BY reaction) AS reaction_list_str,
-               count(DISTINCT reaction)::INTEGER AS num_reactions
-        FROM cleaned
-        GROUP BY primaryid
-        """
+        """,
+        aggregate_columns="""
+            string_agg(DISTINCT value, '|' ORDER BY value) AS reaction_list_str,
+            count(DISTINCT value)::INTEGER AS num_reactions
+        """,
+        empty_columns="primaryid VARCHAR, reaction_list_str VARCHAR, num_reactions INTEGER",
     )
     serious = ", ".join(f"'{code}'" for code in SERIOUS_OUTCOME_CODES)
-    connection.execute(
-        f"""
-        CREATE TABLE outcome_agg AS
-        WITH cleaned AS (
-            SELECT o.primaryid, upper(trim(o.outc_cod)) AS outcome
+    _create_bucketed_aggregate(
+        connection,
+        work_dir=work_dir,
+        buckets=buckets,
+        name="outcome",
+        source_sql="""
+            SELECT o.primaryid, upper(trim(o.outc_cod)) AS value
             FROM outc_source o
             JOIN latest_demo l USING (primaryid)
             WHERE o.outc_cod IS NOT NULL AND trim(o.outc_cod) <> ''
+        """,
+        aggregate_columns=f"""
+            string_agg(DISTINCT value, '|' ORDER BY value) AS outcome_codes,
+            max(CASE WHEN value IN ({serious}) THEN 1 ELSE 0 END)::INTEGER AS is_serious
+        """,
+        empty_columns="primaryid VARCHAR, outcome_codes VARCHAR, is_serious INTEGER",
+    )
+
+
+def _create_bucketed_aggregate(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    work_dir: Path,
+    buckets: int,
+    name: str,
+    source_sql: str,
+    aggregate_columns: str,
+    empty_columns: str,
+) -> None:
+    """Partition large non-spillable string aggregates into bounded hash buckets."""
+    if buckets < 1:
+        raise ValueError("aggregate buckets must be positive")
+    source_dir = work_dir / name / "source"
+    aggregate_dir = work_dir / name / "aggregate"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    aggregate_dir.mkdir(parents=True, exist_ok=True)
+    source_path = _sql_literal(source_dir.as_posix())
+    started = time.monotonic()
+    print(f"  {name}: partitioning source rows...", flush=True)
+    connection.execute(
+        f"""
+        COPY (
+            SELECT primaryid, value,
+                   cast(hash(primaryid) % {buckets} AS INTEGER) AS bucket
+            FROM ({source_sql}) source_rows
+        ) TO '{source_path}' (
+            FORMAT PARQUET,
+            COMPRESSION SNAPPY,
+            PARTITION_BY (bucket),
+            ROW_GROUP_SIZE 100000
         )
-        SELECT primaryid,
-               string_agg(DISTINCT outcome, '|' ORDER BY outcome) AS outcome_codes,
-               max(CASE WHEN outcome IN ({serious}) THEN 1 ELSE 0 END)::INTEGER AS is_serious
-        FROM cleaned
-        GROUP BY primaryid
         """
     )
+
+    completed = 0
+    for bucket in range(buckets):
+        bucket_dir = source_dir / f"bucket={bucket}"
+        if not bucket_dir.is_dir() or not any(bucket_dir.glob("*.parquet")):
+            continue
+        source_glob = _sql_literal((bucket_dir / "*.parquet").as_posix())
+        destination = _sql_literal((aggregate_dir / f"part-{bucket:03d}.parquet").as_posix())
+        connection.execute(
+            f"""
+            COPY (
+                SELECT primaryid, {aggregate_columns}
+                FROM read_parquet('{source_glob}')
+                GROUP BY primaryid
+            ) TO '{destination}' (
+                FORMAT PARQUET,
+                COMPRESSION SNAPPY,
+                ROW_GROUP_SIZE 100000
+            )
+            """
+        )
+        completed += 1
+        if completed == 1 or completed % 8 == 0:
+            print(f"  {name}: aggregated {completed}/{buckets} buckets", flush=True)
+
+    table_name = f"{name}_agg"
+    aggregate_files = sorted(aggregate_dir.glob("*.parquet"))
+    if aggregate_files:
+        aggregate_glob = _sql_literal((aggregate_dir / "*.parquet").as_posix())
+        connection.execute(
+            f"CREATE VIEW {table_name} AS SELECT * FROM read_parquet('{aggregate_glob}')"
+        )
+    else:
+        connection.execute(f"CREATE TABLE {table_name} ({empty_columns})")
+    shutil.rmtree(source_dir, ignore_errors=True)
+    elapsed = time.monotonic() - started
+    print(f"  {name}: complete in {elapsed:.1f}s", flush=True)
 
 
 def _create_cohort_table(connection: duckdb.DuckDBPyConnection) -> None:
@@ -428,36 +549,128 @@ def _create_cohort_table(connection: duckdb.DuckDBPyConnection) -> None:
     )
 
 
-def _create_edge_tables(connection: duckdb.DuckDBPyConnection) -> None:
-    connection.execute(
-        """
-        CREATE TABLE report_drug_edges AS
-        SELECT DISTINCT c.primaryid, c.caseid, c.split,
+def _create_edge_tables(
+    connection: duckdb.DuckDBPyConnection, *, work_dir: Path, buckets: int
+) -> None:
+    _create_bucketed_edges(
+        connection,
+        work_dir=work_dir,
+        buckets=buckets,
+        name="drug-edge",
+        table_name="report_drug_edges",
+        source_sql="""
+        SELECT c.primaryid, c.caseid, c.split,
                d.drug_seq, d.role_cod, d.drugname, d.prod_ai,
                d.route, d.dose_amt, d.dose_unit, d.dose_form, d.dose_freq
         FROM cohort_final c
         JOIN drug_source d USING (primaryid, caseid)
         WHERE d.drugname IS NOT NULL AND trim(d.drugname) <> ''
-        """
+        """,
+        empty_columns=(
+            "primaryid VARCHAR, caseid VARCHAR, split VARCHAR, drug_seq VARCHAR, "
+            "role_cod VARCHAR, drugname VARCHAR, prod_ai VARCHAR, route VARCHAR, "
+            "dose_amt VARCHAR, dose_unit VARCHAR, dose_form VARCHAR, dose_freq VARCHAR"
+        ),
     )
-    connection.execute(
-        """
-        CREATE TABLE report_reaction_edges AS
-        SELECT DISTINCT c.primaryid, c.caseid, c.split, r.pt, r.drug_rec_act
+    _create_bucketed_edges(
+        connection,
+        work_dir=work_dir,
+        buckets=buckets,
+        name="reaction-edge",
+        table_name="report_reaction_edges",
+        source_sql="""
+        SELECT c.primaryid, c.caseid, c.split, r.pt, r.drug_rec_act
         FROM cohort_final c
         JOIN reac_source r USING (primaryid, caseid)
         WHERE r.pt IS NOT NULL AND trim(r.pt) <> ''
-        """
+        """,
+        empty_columns=(
+            "primaryid VARCHAR, caseid VARCHAR, split VARCHAR, pt VARCHAR, "
+            "drug_rec_act VARCHAR"
+        ),
     )
-    connection.execute(
-        """
-        CREATE TABLE report_outcome_edges AS
-        SELECT DISTINCT c.primaryid, c.caseid, c.split, upper(trim(o.outc_cod)) AS outc_cod
+    _create_bucketed_edges(
+        connection,
+        work_dir=work_dir,
+        buckets=buckets,
+        name="outcome-edge",
+        table_name="report_outcome_edges",
+        source_sql="""
+        SELECT c.primaryid, c.caseid, c.split, upper(trim(o.outc_cod)) AS outc_cod
         FROM cohort_final c
         JOIN outc_source o USING (primaryid, caseid)
         WHERE o.outc_cod IS NOT NULL AND trim(o.outc_cod) <> ''
+        """,
+        empty_columns="primaryid VARCHAR, caseid VARCHAR, split VARCHAR, outc_cod VARCHAR",
+    )
+
+
+def _create_bucketed_edges(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    work_dir: Path,
+    buckets: int,
+    name: str,
+    table_name: str,
+    source_sql: str,
+    empty_columns: str,
+) -> None:
+    """Bound wide edge-table deduplication by patient-hash partition."""
+    if buckets < 1:
+        raise ValueError("edge buckets must be positive")
+    source_dir = work_dir / name / "source"
+    edge_dir = work_dir / name / "deduplicated"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    edge_dir.mkdir(parents=True, exist_ok=True)
+    source_path = _sql_literal(source_dir.as_posix())
+    started = time.monotonic()
+    print(f"  {name}: partitioning source rows...", flush=True)
+    connection.execute(
+        f"""
+        COPY (
+            SELECT source_rows.*,
+                   cast(hash(primaryid) % {buckets} AS INTEGER) AS bucket
+            FROM ({source_sql}) source_rows
+        ) TO '{source_path}' (
+            FORMAT PARQUET,
+            COMPRESSION SNAPPY,
+            PARTITION_BY (bucket),
+            ROW_GROUP_SIZE 100000
+        )
         """
     )
+    completed = 0
+    for bucket in range(buckets):
+        bucket_dir = source_dir / f"bucket={bucket}"
+        if not bucket_dir.is_dir() or not any(bucket_dir.glob("*.parquet")):
+            continue
+        source_glob = _sql_literal((bucket_dir / "*.parquet").as_posix())
+        destination = _sql_literal((edge_dir / f"part-{bucket:03d}.parquet").as_posix())
+        connection.execute(
+            f"""
+            COPY (
+                SELECT DISTINCT * FROM read_parquet('{source_glob}')
+            ) TO '{destination}' (
+                FORMAT PARQUET,
+                COMPRESSION SNAPPY,
+                ROW_GROUP_SIZE 100000
+            )
+            """
+        )
+        completed += 1
+        if completed == 1 or completed % 8 == 0:
+            print(f"  {name}: deduplicated {completed}/{buckets} buckets", flush=True)
+
+    edge_files = sorted(edge_dir.glob("*.parquet"))
+    if edge_files:
+        edge_glob = _sql_literal((edge_dir / "*.parquet").as_posix())
+        connection.execute(
+            f"CREATE VIEW {table_name} AS SELECT * FROM read_parquet('{edge_glob}')"
+        )
+    else:
+        connection.execute(f"CREATE TABLE {table_name} ({empty_columns})")
+    shutil.rmtree(source_dir, ignore_errors=True)
+    print(f"  {name}: complete in {time.monotonic() - started:.1f}s", flush=True)
 
 
 def _copy_parquet(connection: duckdb.DuckDBPyConnection, *, table: str, destination: Path) -> None:
@@ -494,11 +707,13 @@ def _audit_tables(connection: duckdb.DuckDBPyConnection) -> dict[str, int]:
         "reaction_edges": _count(connection, "report_reaction_edges"),
         "outcome_edges": _count(connection, "report_outcome_edges"),
         "source_demo_rows": _count(connection, "demo_source"),
-        "source_cases": connection.execute(
-            "SELECT count(DISTINCT caseid) FROM demo_source WHERE caseid IS NOT NULL"
+        "source_cases": _count(connection, "latest_demo_all")
+        + connection.execute(
+            "SELECT count(DISTINCT d.caseid) FROM demo_source d "
+            "JOIN deleted_cases x USING (caseid) WHERE d.caseid IS NOT NULL"
         ).fetchone()[0],
         "deleted_cases": _count(connection, "deleted_cases"),
-        "nondeleted_cases": _count(connection, "case_dates"),
+        "nondeleted_cases": _count(connection, "latest_demo_all"),
         "latest_cases": _count(connection, "latest_demo_all"),
         "valid_age_cases": _count(connection, "latest_demo_age_valid"),
         "cases_with_drugs": _count(connection, "drug_agg"),

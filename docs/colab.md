@@ -103,6 +103,11 @@ On a standard Colab runtime with about 12.7 GiB of system RAM, the notebook caps
 intermediates to `/content/tekarx-data/interim/.duckdb_temp/`. The remaining memory is reserved
 for Python, Arrow, the operating system, and filesystem cache. Do not raise this above 7 GB on
 that runtime; use a high-memory runtime if one query still cannot complete with spilling enabled.
+The cohort builder additionally projects only the required DEMO columns before version ranking and
+hash-partitions drug, reaction, outcome, and wide edge rows into 64 temporary Parquet buckets. This
+bounds the otherwise non-spillable ordered string-aggregation and edge-deduplication states while
+preserving the final pipe-separated lists and separate graph edge tables. Bucket files are deleted
+after the atomic cohort build.
 
 The graph audit requires:
 
