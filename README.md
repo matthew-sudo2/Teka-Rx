@@ -219,6 +219,34 @@ tekarx train-gnn --device cuda
 The trainer uses only training labels, uses validation only for early stopping, and does not read
 test labels unless `--evaluate-test` is explicitly supplied.
 
+Render a bounded, interactive patient-drug sample without loading the graph into RAM:
+
+```powershell
+tekarx visualize-graph --split validation --patients 100 --top-drugs 50
+```
+
+Use `--layout 3d` for a rotatable, zoomable three-dimensional projection:
+
+```powershell
+tekarx visualize-graph --layout 3d --split validation --patients 100 --top-drugs 50
+```
+
+The 3D view labels the 15 highest-degree drugs by default. Its in-browser label selector can show
+all nodes or hide labels, while hovering always labels the selected node and its neighbors. The
+view uses a white clinical-dashboard theme, healthcare-oriented navy/teal colors, system UI
+typography, and depth shadows that keep nodes distinct from the canvas.
+
+The command writes `data/processed/graph_visualization.html` and a JSON sampling manifest. It
+memory-maps only topology, labels, patient IDs, and drug metadata; it never attempts a force layout
+of the complete multi-million-node graph. Pass `--graph-dir` to visualize a versioned graph
+checkpoint or topology-only visualization checkpoint.
+
+For the verified `gnn-full` Drive checkpoint, open
+[`notebooks/visualize_full_graph_colab.ipynb`](notebooks/visualize_full_graph_colab.ipynb) in
+Colab. It restores only the approximately 270 MB visualization projection, displays byte-level
+copy progress, creates the labeled 3D view, reports its percentage of the 8.18-million-patient
+graph, and saves the HTML plus provenance JSON back to Drive.
+
 Run the train-frozen feature-rescue package:
 
 ```powershell

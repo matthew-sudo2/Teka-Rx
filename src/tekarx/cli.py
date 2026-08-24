@@ -31,6 +31,7 @@ from tekarx.transform import (
     build_prospective_pipeline,
     build_rxnorm_lookup,
 )
+from tekarx.visualization import visualize_graph
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -310,6 +311,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="explicitly consume final test labels after model selection",
     )
+
+    visualization = subparsers.add_parser(
+        "visualize-graph",
+        help="render a memory-safe interactive sample of the patient-drug graph",
+    )
+    visualization.add_argument(
+        "--data-dir", type=Path, default=Path(os.getenv("TEKARX_DATA_DIR", "data"))
+    )
+    visualization.add_argument(
+        "--graph-dir",
+        type=Path,
+        help="graph checkpoint, array directory, or array manifest; auto-detected by default",
+    )
+    visualization.add_argument(
+        "--split", choices=("train", "validation", "test"), default="validation"
+    )
+    visualization.add_argument(
+        "--layout",
+        choices=("2d", "3d"),
+        default="2d",
+        help="interactive rendering mode; default: 2d",
+    )
+    visualization.add_argument("--patients", type=int, default=100)
+    visualization.add_argument("--top-drugs", type=int, default=50)
+    visualization.add_argument("--seed", type=int, default=42)
+    visualization.add_argument("--output", type=Path)
     return parser
 
 
@@ -523,6 +550,19 @@ def main(argv: list[str] | None = None) -> int:
                 checkpoint_every=args.checkpoint_every,
             )
             print(json.dumps(asdict(gnn_record), indent=2, sort_keys=True))
+            return 0
+        elif args.command == "visualize-graph":
+            visualization_record = visualize_graph(
+                data_dir=paths.root,
+                graph_dir=args.graph_dir,
+                split=args.split,
+                layout=args.layout,
+                patients=args.patients,
+                top_drugs=args.top_drugs,
+                seed=args.seed,
+                output=args.output,
+            )
+            print(json.dumps(asdict(visualization_record), indent=2, sort_keys=True))
             return 0
         else:
             _unreachable(args.command)

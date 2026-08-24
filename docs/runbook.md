@@ -455,6 +455,32 @@ incremental dosage package (relative amount/daily-dose, availability, scheduling
 parenteral features) but leaves the existing coarse exposure fields and the rest of the prospective
 graph feature set unchanged.
 
+#### Visualize a sampled patient-drug graph
+
+Do not try to lay out the complete graph. Render a deterministic, bounded bipartite sample instead:
+
+```powershell
+tekarx visualize-graph --split validation --patients 100 --top-drugs 50
+```
+
+Add `--layout 3d` for a canvas-based depth projection with drag rotation, wheel zoom,
+auto-rotation, depth-aware node sizing, top-drug labels, and hover-neighborhood isolation. The
+label selector can switch between the 15 highest-degree drugs, every displayed node, or no labels.
+The standalone renderer uses a white clinical-dashboard surface, restrained navy/teal colors,
+professional system UI fonts, and depth shadows rather than a dark visualization theme.
+
+The standalone `data/processed/graph_visualization.html` supports hover-neighborhood highlighting,
+serious/non-serious filters, drug-degree sizing, ATC tooltips, and boxed-warning borders. Numeric
+arrays are opened with NumPy memory mapping. `--graph-dir` can point to a graph checkpoint, its
+`tekarx_graph_arrays` directory, or `manifest.json`. The renderer requires only patient IDs,
+targets, split IDs, edge indices, drug metadata, and optionally `drug_x`; `patient_x` is not read.
+
+To visualize the verified full checkpoint in Google Colab without copying its 3.86 GB patient
+feature matrix, run [`notebooks/visualize_full_graph_colab.ipynb`](../notebooks/visualize_full_graph_colab.ipynb).
+The notebook validates `_GRAPH_SUCCESS.json`, restores the exact full topology needed by the
+renderer with progress bars, reports sample-to-full percentages, and checkpoints the standalone
+HTML and JSON manifest in Drive.
+
 ### Run the feature-rescue package
 
 FAERS stores indications in the separate INDI table, not DRUG. Stage it and run:
