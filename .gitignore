@@ -1,44 +1,19 @@
-# Local Python environment and caches
-.venv/
+```
+# Jupyter Notebook checkpoints
+.checkpoints/
+
+# Python compiled files
 __pycache__/
-*.py[cod]
-.pytest_cache/
-pytest-cache-files-*/
-.ruff_cache/
-.mypy_cache/
-.hypothesis/
-.tox/
-.nox/
-.coverage
-.coverage.*
-htmlcov/
+*.pyc
+*.pyo
+*.pyd
 
-# Local configuration and secrets
-.env*
-!.env.example
-.envrc
-.pypirc
-.streamlit/secrets.toml
-client_secret*.json
-credentials*.json
-service-account*.json
-*.log
+# Virtual environments
+venv/
+.venv/
+env/
+.ENV/
 
-# Downloaded and generated data
-/data/
-*.duckdb
-*.duckdb.wal
-
-# Build artifacts
-build/
-dist/
-*.egg-info/
-
-# Notebook checkpoints (notebooks may be added later)
+# Jupyter specific
 .ipynb_checkpoints/
-
-# Editor and operating-system files
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
+```
