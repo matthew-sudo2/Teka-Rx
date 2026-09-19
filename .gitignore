@@ -1,19 +1,56 @@
-```
-# Jupyter Notebook checkpoints
-.checkpoints/
-
-# Python compiled files
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Virtual environments
-venv/
+# Local Python environment and caches
 .venv/
+venv/
 env/
 .ENV/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
 
-# Jupyter specific
+# Local configuration and secrets
+.env*
+!.env.example
+.envrc
+.pypirc
+.streamlit/secrets.toml
+client_secret*.json
+credentials*.json
+service-account*.json
+*.log
+
+# Downloaded and generated data
+data/
+*.duckdb
+*.duckdb.wal
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+node_modules/
+
+# Frontend tooling
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+frontend/data/
+
+# Jupyter specific and checkpoints
+.checkpoints/
 .ipynb_checkpoints/
-```
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

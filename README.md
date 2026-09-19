@@ -31,6 +31,14 @@ memory-mapped graph access, and training run from Colab's local `/content` disk.
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/matthew-sudo2/Teka-Rx/blob/main/notebooks/train_full_colab.ipynb)
 
+After the versioned full graph and validation-selected GNN exist in Drive, run the separate
+[`gnn_ablation_study_colab.ipynb`](notebooks/gnn_ablation_study_colab.ipynb) notebook to
+compare the full GNN, no-dosage, patient-only, shuffled-topology, and saved XGBoost arms.
+It reports AUROC, AUPRC, accuracy, precision, recall, F1, specificity, NPV, calibration,
+confusion counts, and configurable threshold policies while keeping the 2024Q2 test locked.
+
+[![Open ablation study in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/matthew-sudo2/Teka-Rx/blob/main/notebooks/gnn_ablation_study_colab.ipynb)
+
 ## Installation
 
 Python 3.12 or newer is required.
@@ -219,27 +227,38 @@ tekarx train-gnn --device cuda
 The trainer uses only training labels, uses validation only for early stopping, and does not read
 test labels unless `--evaluate-test` is explicitly supplied.
 
-Render a bounded, interactive patient-drug sample without loading the graph into RAM:
+The current `gnn-full` evidence, limitations, literature-grounded metric definitions, and the
+prespecified path to a one-time temporal test are documented in
+[`docs/gnn_full_evaluation.md`](docs/gnn_full_evaluation.md). The report treats the present
+0.8880 validation AUROC as model-selection evidence, not a complete clinical evaluation.
+
+Export an interactive patient-drug view without loading the graph into RAM:
 
 ```powershell
 tekarx visualize-graph --split validation --patients 100 --top-drugs 50
 ```
 
-Use `--layout 3d` for a rotatable, zoomable three-dimensional projection:
+The default is a rotatable, zoomable WebGL2 three-dimensional projection. For a million-patient
+training view, retain the required number of highest-frequency drug nodes explicitly:
 
 ```powershell
-tekarx visualize-graph --layout 3d --split validation --patients 100 --top-drugs 50
+tekarx visualize-graph --split train --patients 1000000 --top-drugs 5000 `
+  --output data/processed/graph_1m.html
+cd data/processed
+python -m http.server 8000
 ```
 
-The 3D view labels the 15 highest-degree drugs by default. Its in-browser label selector can show
-all nodes or hide labels, while hovering always labels the selected node and its neighbors. The
-view uses a white clinical-dashboard theme, healthcare-oriented navy/teal colors, system UI
-typography, and depth shadows that keep nodes distinct from the canvas.
+Open `http://localhost:8000/graph_1m.html`; direct `file://` opening cannot fetch browser binary
+buffers. The view labels the 15 highest-degree drugs by default, supports severity filters and
+edge draw fractions, and uses a white clinical-dashboard theme with restrained healthcare colors.
 
-The command writes `data/processed/graph_visualization.html` and a JSON sampling manifest. It
-memory-maps only topology, labels, patient IDs, and drug metadata; it never attempts a force layout
-of the complete multi-million-node graph. Pass `--graph-dir` to visualize a versioned graph
-checkpoint or topology-only visualization checkpoint.
+The command writes an HTML launcher, a provenance JSON file, and a sibling `_assets` directory
+containing Float32 coordinates, Uint8 patient categories, packed Int32 edges, drug metadata, and a
+compact manifest. Coordinates use a deterministic static bipartite projection; their distances are
+visual organization, not learned clinical similarity. GPU point instancing renders nodes in one
+draw call per node type. Source topology stays memory-mapped and edge selection uses two chunked
+passes. The binary size is approximately `14 * patients + 8 * retained_edges + 12 * drugs` bytes.
+Pass `--graph-dir` to visualize a versioned or topology-only graph checkpoint.
 
 For the verified `gnn-full` Drive checkpoint, open
 [`notebooks/visualize_full_graph_colab.ipynb`](notebooks/visualize_full_graph_colab.ipynb) in

@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>__TEKARX_TITLE__</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Segoe UI Variable", "Aptos", "Segoe UI", Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; background: #fff; color: #17324d; }
+    canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+    #labels { pointer-events: none; }
+    #scene { cursor: grab; }
+    #scene.dragging { cursor: grabbing; }
+    .panel {
+      position: fixed;
+      z-index: 4;
+      background: rgba(255,255,255,.96);
+      border: 1px solid #dbe5ec;
+      box-shadow: 0 10px 28px rgba(30,64,90,.12);
+      backdrop-filter: blur(10px);
+    }
+    header {
+      top: 16px;
+      left: 16px;
+      right: 16px;
+      padding: 14px 18px 13px 21px;
+      border-radius: 12px;
+      border-left: 4px solid #16888b;
+    }
+    h1 { margin: 0 0 4px; color: #15344f; font-size: 20px; font-weight: 650; }
+    .sub { color: #60788b; font-size: 12px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 13px; align-items: center; margin-top: 10px; }
+    label, button, select { color: #29475f; font: 500 12px inherit; }
+    button, select {
+      background: #f7fafb;
+      border: 1px solid #b9cbd6;
+      padding: 5px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover, select:hover { border-color: #16888b; background: #eef8f8; }
+    input { accent-color: #16888b; }
+    input[type=range] { vertical-align: middle; }
+    .legend { right: 18px; bottom: 18px; padding: 10px 13px; border-radius: 10px; font-size: 12px; }
+    .legend div { margin: 4px 0; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 7px; }
+    #status-card { left: 18px; bottom: 18px; padding: 9px 12px; border-radius: 8px; font-size: 12px; }
+    #tooltip {
+      display: none;
+      position: fixed;
+      z-index: 6;
+      pointer-events: none;
+      max-width: 310px;
+      padding: 9px 11px;
+      border-radius: 7px;
+      background: rgba(255,255,255,.98);
+      border: 1px solid #b9cbd6;
+      box-shadow: 0 8px 24px rgba(30,64,90,.18);
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-line;
+    }
+    .hint { color: #60788b; }
+    .error { color: #a2393f; font-weight: 650; }
+  </style>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+  <canvas id="labels"></canvas>
+  <header class="panel">
+    <h1>__TEKARX_TITLE__</h1>
+    <div class="sub" id="summary">Loading binary graph manifest...</div>
+    <div class="controls">
+      <span class="hint">Drag to rotate · Wheel to zoom · Hover over a labeled drug</span>
+      <label><input id="show-serious" type="checkbox" checked> Serious</label>
+      <label><input id="show-nonserious" type="checkbox" checked> Non-serious</label>
+      <label><input id="autorotate" type="checkbox"> Auto-rotate</label>
+      <label>Labels
+        <select id="label-count">
+          <option value="10">Top 10</option>
+          <option value="15" selected>Top 15</option>
+          <option value="30">Top 30</option>
+          <option value="0">None</option>
+        </select>
+      </label>
+      <label>Edges
+        <select id="edge-fraction">
+          <option value="1" selected>All</option>
+          <option value="0.5">50%</option>
+          <option value="0.25">25%</option>
+          <option value="0.1">10%</option>
+          <option value="0">Hidden</option>
+        </select>
+      </label>
+      <label>Edge opacity <input id="edge-opacity" type="range" min="0.01" max="0.35" step="0.01" value="0.08"></label>
+      <label>Patient size <input id="point-size" type="range" min="1" max="8" step="0.5" value="3"></label>
+      <button id="reset">Reset view</button>
+    </div>
+  </header>
+  <aside class="panel legend">
+    <div><i class="dot" style="background:#c54f55"></i>Serious patient</div>
+    <div><i class="dot" style="background:#397aa8"></i>Non-serious patient</div>
+    <div><i class="dot" style="background:#16888b"></i>Drug / ATC class</div>
+    <div><i class="dot" style="background:#d99a24"></i>Boxed-warning rim</div>
+  </aside>
+  <div id="status-card" class="panel">Preparing GPU renderer...</div>
+  <div id="tooltip"></div>
+  <script>
+  "use strict";
+  const MANIFEST_URL = __TEKARX_MANIFEST_URL__;
+  const LAYOUT = __TEKARX_LAYOUT__;
+  const scene = document.querySelector("#scene");
+  const labelsCanvas = document.querySelector("#labels");
+  const labelContext = labelsCanvas.getContext("2d");
+  const summary = document.querySelector("#summary");
+  const statusCard = document.querySelector("#status-card");
+  const tooltip = document.querySelector("#tooltip");
+  let state = null;
+
+  if (location.protocol === "file:") {
+    statusCard.innerHTML = '<span class="error">Binary fetch requires HTTP.</span> From this HTML directory run: python -m http.server 8000';
+  } else {
+    loadGraphData().catch(showError);
+  }
+
+  async function loadGraphData() {
+    statusCard.textContent = "Fetching compact manifest...";
+    const manifestResponse = await fetch(MANIFEST_URL);
+    if (!manifestResponse.ok) throw new Error(`Manifest request failed: ${manifestResponse.status}`);
+    const manifest = await manifestResponse.json();
+    if (manifest.format !== "tekarx.webgl_graph") throw new Error("Unsupported visualization manifest");
+    const base = new URL(MANIFEST_URL, location.href);
+    const assetUrl = name => new URL(manifest.arrays[name].path, base).href;
+    const metadataUrl = new URL(manifest.drug_metadata_path, base).href;
+    statusCard.textContent = "Streaming binary coordinates, categories, and edges...";
+    const requests = await Promise.all([
+      fetch(assetUrl("patient_coords")),
+      fetch(assetUrl("drug_coords")),
+      fetch(assetUrl("patient_y")),
+      fetch(assetUrl("patient_split_id")),
+      fetch(assetUrl("edges")),
+      fetch(metadataUrl),
+    ]);
+    for (const response of requests) {
+      if (!response.ok) throw new Error(`Asset request failed: ${response.url} (${response.status})`);
+    }
+    const [patientBuffer, drugBuffer, yBuffer, splitBuffer, edgeBuffer, drugMetadata] = await Promise.all([
+      requests[0].arrayBuffer(), requests[1].arrayBuffer(), requests[2].arrayBuffer(),
+      requests[3].arrayBuffer(), requests[4].arrayBuffer(), requests[5].json(),
+    ]);
+    verifyBytes(patientBuffer, manifest.arrays.patient_coords, "patient coordinates");
+    verifyBytes(drugBuffer, manifest.arrays.drug_coords, "drug coordinates");
+    verifyBytes(yBuffer, manifest.arrays.patient_y, "patient labels");
+    verifyBytes(splitBuffer, manifest.arrays.patient_split_id, "split IDs");
+    verifyBytes(edgeBuffer, manifest.arrays.edges, "edge indices");
+    initWebGLRenderer(
+      new Float32Array(patientBuffer), new Float32Array(drugBuffer),
+      new Uint8Array(yBuffer), new Uint8Array(splitBuffer),
+      new Uint32Array(edgeBuffer), drugMetadata, manifest,
+    );
+  }
+
+  function verifyBytes(buffer, metadata, label) {
+    if (buffer.byteLength !== metadata.bytes) {
+      throw new Error(`${label} byte mismatch: ${buffer.byteLength} != ${metadata.bytes}`);
+    }
+  }
+
+  function showError(error) {
+    console.error(error);
+    statusCard.innerHTML = `<span class="error">Visualization failed:</span> ${escapeHtml(error.message)}`;
+  }
+
+  function escapeHtml(value) {
+    const node = document.createElement("span");
+    node.textContent = value;
+    return node.innerHTML;
+  }
+
+  function initWebGLRenderer(patientCoords, drugCoords, patientY, patientSplit, edges, drugs, manifest) {
+    const gl = scene.getContext("webgl2", { alpha: false, antialias: true, powerPreference: "high-performance" });
+    if (!gl) throw new Error("WebGL2 is required. Enable hardware acceleration or use a current Chrome/Edge browser.");
+    const patientCount = manifest.counts.patients;
+    const drugCount = manifest.counts.drugs;
+    const edgeCount = manifest.counts.edges;
+    if (patientCoords.length !== patientCount * 3 || drugCoords.length !== drugCount * 3) {
+      throw new Error("Coordinate shape does not match manifest");
+    }
+    if (patientY.length !== patientCount || patientSplit.length !== patientCount || edges.length !== edgeCount * 2) {
+      throw new Error("Categorical or edge shape does not match manifest");
+    }
+    const combinedCoords = new Float32Array(patientCoords.length + drugCoords.length);
+    combinedCoords.set(patientCoords, 0);
+    combinedCoords.set(drugCoords, patientCoords.length);
+    const drugClasses = new Uint8Array(drugCount);
+    drugs.forEach((drug, index) => {
+      const atc = drug.atc && drug.atc !== "?" ? Math.max(0, drug.atc.charCodeAt(0) - 65) : 26;
+      drugClasses[index] = atc + (drug.boxed_warning ? 128 : 0);
+    });
+
+    const pointProgram = createProgram(gl, POINT_VERTEX_SHADER, POINT_FRAGMENT_SHADER);
+    const edgeProgram = createProgram(gl, EDGE_VERTEX_SHADER, EDGE_FRAGMENT_SHADER);
+    const patientVao = createPointVao(gl, pointProgram, patientCoords, patientY);
+    const drugVao = createPointVao(gl, pointProgram, drugCoords, drugClasses);
+    const edgeVao = createEdgeVao(gl, edgeProgram, combinedCoords, edges);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+
+    state = {
+      gl, patientCount, drugCount, edgeCount, patientCoords, drugCoords, patientY,
+      patientSplit, edges, drugs, manifest, pointProgram, edgeProgram, patientVao,
+      drugVao, edgeVao, rx: LAYOUT === "3d" ? -0.16 : 0, ry: LAYOUT === "3d" ? 0.52 : 0,
+      distance: 4.5, dragging: false, lastX: 0, lastY: 0, mvp: null,
+    };
+    summary.textContent = `${patientCount.toLocaleString()} patients (${manifest.counts.serious_patients.toLocaleString()} serious) · ${drugCount.toLocaleString()} drugs · ${edgeCount.toLocaleString()} exposures · ${formatBytes(totalBinaryBytes(manifest))}`;
+    statusCard.textContent = `GPU ready · ${gl.getParameter(gl.RENDERER)}`;
+    bindControls();
+    resize();
+    let previous = performance.now();
+    function animate(now) {
+      if (document.querySelector("#autorotate").checked && LAYOUT === "3d") {
+        state.ry += (now - previous) * 0.00012;
+        draw();
+      }
+      previous = now;
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+  }
+
+  function totalBinaryBytes(manifest) {
+    return Object.values(manifest.arrays).reduce((sum, item) => sum + item.bytes, 0);
+  }
+
+  function formatBytes(bytes) {
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MiB binary`;
+  }
+
+  function createShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+    return shader;
+  }
+
+  function createProgram(gl, vertexSource, fragmentSource) {
+    const program = gl.createProgram();
+    gl.attachShader(program, createShader(gl, gl.VERTEX_SHADER, vertexSource));
+    gl.attachShader(program, createShader(gl, gl.FRAGMENT_SHADER, fragmentSource));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+    return program;
+  }
+
+  function createPointVao(gl, program, coords, classes) {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, coords, gl.STATIC_DRAW);
+    const position = gl.getAttribLocation(program, "aPosition");
+    gl.enableVertexAttribArray(position);
+    gl.vertexAttribPointer(position, 3, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(position, 1);
+    const classBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, classBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, classes, gl.STATIC_DRAW);
+    const category = gl.getAttribLocation(program, "aCategory");
+    gl.enableVertexAttribArray(category);
+    gl.vertexAttribIPointer(category, 1, gl.UNSIGNED_BYTE, 0, 0);
+    gl.vertexAttribDivisor(category, 1);
+    gl.bindVertexArray(null);
+    return vao;
+  }
+
+  function createEdgeVao(gl, program, coords, edges) {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, coords, gl.STATIC_DRAW);
+    const position = gl.getAttribLocation(program, "aPosition");
+    gl.enableVertexAttribArray(position);
+    gl.vertexAttribPointer(position, 3, gl.FLOAT, false, 0, 0);
+    const edgeBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, edgeBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, edges, gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    return vao;
+  }
+
+  function resize() {
+    if (!state) return;
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    for (const canvas of [scene, labelsCanvas]) {
+      canvas.width = Math.floor(innerWidth * dpr);
+      canvas.height = Math.floor(innerHeight * dpr);
+      canvas.style.width = `${innerWidth}px`;
+      canvas.style.height = `${innerHeight}px`;
+    }
+    labelContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+    state.gl.viewport(0, 0, scene.width, scene.height);
+    draw();
+  }
+
+  function draw() {
+    if (!state) return;
+    const { gl } = state;
+    const projection = perspective(Math.PI / 4, innerWidth / Math.max(1, innerHeight), 0.1, 100);
+    const view = translation(0, 0, -state.distance);
+    const rotation = multiply(rotationX(state.rx), rotationY(state.ry));
+    state.mvp = multiply(projection, multiply(view, rotation));
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    const edgeFraction = Number(document.querySelector("#edge-fraction").value);
+    if (edgeFraction > 0) {
+      gl.useProgram(state.edgeProgram);
+      gl.uniformMatrix4fv(gl.getUniformLocation(state.edgeProgram, "uMvp"), false, state.mvp);
+      gl.uniform1f(gl.getUniformLocation(state.edgeProgram, "uOpacity"), Number(document.querySelector("#edge-opacity").value));
+      gl.bindVertexArray(state.edgeVao);
+      gl.drawElements(gl.LINES, Math.floor(state.edgeCount * edgeFraction) * 2, gl.UNSIGNED_INT, 0);
+    }
+    gl.useProgram(state.pointProgram);
+    gl.uniformMatrix4fv(gl.getUniformLocation(state.pointProgram, "uMvp"), false, state.mvp);
+    gl.uniform1i(gl.getUniformLocation(state.pointProgram, "uShowSerious"), document.querySelector("#show-serious").checked);
+    gl.uniform1i(gl.getUniformLocation(state.pointProgram, "uShowNonserious"), document.querySelector("#show-nonserious").checked);
+    gl.uniform1i(gl.getUniformLocation(state.pointProgram, "uKind"), 0);
+    gl.uniform1f(gl.getUniformLocation(state.pointProgram, "uPointSize"), Number(document.querySelector("#point-size").value));
+    gl.bindVertexArray(state.patientVao);
+    gl.drawArraysInstanced(gl.POINTS, 0, 1, state.patientCount);
+    gl.uniform1i(gl.getUniformLocation(state.pointProgram, "uKind"), 1);
+    gl.uniform1f(gl.getUniformLocation(state.pointProgram, "uPointSize"), 10);
+    gl.bindVertexArray(state.drugVao);
+    gl.drawArraysInstanced(gl.POINTS, 0, 1, state.drugCount);
+    gl.bindVertexArray(null);
+    drawLabels();
+  }
+
+  function drawLabels() {
+    labelContext.clearRect(0, 0, innerWidth, innerHeight);
+    const count = Number(document.querySelector("#label-count").value);
+    if (!state || count === 0) return;
+    const top = [...state.drugs].sort((a, b) => b.degree - a.degree || a.label.localeCompare(b.label)).slice(0, count);
+    labelContext.font = '600 11px "Segoe UI Variable", "Aptos", "Segoe UI", Arial, sans-serif';
+    labelContext.lineJoin = "round";
+    for (const drug of top) {
+      const point = projectPoint(state.drugCoords, drug.index, state.mvp);
+      if (!point || point.x < 0 || point.x > innerWidth || point.y < 105 || point.y > innerHeight) continue;
+      const label = drug.label.length > 30 ? `${drug.label.slice(0, 29)}…` : drug.label;
+      labelContext.lineWidth = 4;
+      labelContext.strokeStyle = "rgba(255,255,255,.96)";
+      labelContext.strokeText(label, point.x + 8, point.y - 5);
+      labelContext.fillStyle = "#17324d";
+      labelContext.fillText(label, point.x + 8, point.y - 5);
+    }
+  }
+
+  function projectPoint(coords, index, matrix) {
+    const offset = index * 3;
+    const x = coords[offset], y = coords[offset + 1], z = coords[offset + 2];
+    const clipX = matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12];
+    const clipY = matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13];
+    const clipW = matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15];
+    if (clipW <= 0) return null;
+    return { x: (clipX / clipW * .5 + .5) * innerWidth, y: (1 - (clipY / clipW * .5 + .5)) * innerHeight };
+  }
+
+  function bindControls() {
+    document.querySelectorAll("input,select").forEach(element => element.addEventListener("input", draw));
+    document.querySelector("#reset").addEventListener("click", () => {
+      state.rx = LAYOUT === "3d" ? -0.16 : 0;
+      state.ry = LAYOUT === "3d" ? 0.52 : 0;
+      state.distance = 4.5;
+      draw();
+    });
+    scene.addEventListener("pointerdown", event => {
+      state.dragging = true; state.lastX = event.clientX; state.lastY = event.clientY;
+      scene.classList.add("dragging"); scene.setPointerCapture(event.pointerId);
+    });
+    scene.addEventListener("pointermove", event => {
+      if (state.dragging && LAYOUT === "3d") {
+        state.ry += (event.clientX - state.lastX) * .007;
+        state.rx += (event.clientY - state.lastY) * .007;
+        state.lastX = event.clientX; state.lastY = event.clientY; tooltip.style.display = "none"; draw();
+      } else if (!state.dragging) {
+        showNearestDrug(event);
+      }
+    });
+    scene.addEventListener("pointerup", () => { state.dragging = false; scene.classList.remove("dragging"); });
+    scene.addEventListener("pointerleave", () => { state.dragging = false; scene.classList.remove("dragging"); tooltip.style.display = "none"; });
+    scene.addEventListener("wheel", event => {
+      event.preventDefault(); state.distance = Math.max(2.2, Math.min(12, state.distance * Math.exp(event.deltaY * .001))); draw();
+    }, { passive: false });
+    window.addEventListener("resize", resize);
+  }
+
+  function showNearestDrug(event) {
+    const candidates = [...state.drugs].sort((a, b) => b.degree - a.degree).slice(0, 250);
+    let best = null, bestDistance = 14;
+    for (const drug of candidates) {
+      const point = projectPoint(state.drugCoords, drug.index, state.mvp);
+      if (!point) continue;
+      const distance = Math.hypot(point.x - event.clientX, point.y - event.clientY);
+      if (distance < bestDistance) { best = drug; bestDistance = distance; }
+    }
+    if (!best) { tooltip.style.display = "none"; return; }
+    tooltip.textContent = `${best.label}\nATC: ${best.atc}\nSample degree: ${best.degree.toLocaleString()}\nBoxed warning: ${best.boxed_warning}\nROR z-score: ${best.ror_z ?? "n/a"}`;
+    tooltip.style.display = "block";
+    tooltip.style.left = `${Math.min(innerWidth - 320, event.clientX + 14)}px`;
+    tooltip.style.top = `${Math.min(innerHeight - 145, event.clientY + 14)}px`;
+  }
+
+  function perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), range = 1 / (near - far);
+    return new Float32Array([f / aspect,0,0,0, 0,f,0,0, 0,0,(near + far) * range,-1, 0,0,near * far * range * 2,0]);
+  }
+  function translation(x, y, z) { return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]); }
+  function rotationX(a) { const c=Math.cos(a),s=Math.sin(a); return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]); }
+  function rotationY(a) { const c=Math.cos(a),s=Math.sin(a); return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]); }
+  function multiply(a, b) {
+    const out = new Float32Array(16);
+    for (let column=0; column<4; column++) for (let row=0; row<4; row++) {
+      out[column*4+row] = a[row]*b[column*4] + a[4+row]*b[column*4+1] + a[8+row]*b[column*4+2] + a[12+row]*b[column*4+3];
+    }
+    return out;
+  }
+
+  const POINT_VERTEX_SHADER = `#version 300 es
+  precision highp float;
+  in vec3 aPosition;
+  in uint aCategory;
+  uniform mat4 uMvp;
+  uniform float uPointSize;
+  uniform int uKind;
+  uniform bool uShowSerious;
+  uniform bool uShowNonserious;
+  out vec3 vColor;
+  flat out uint vBoxed;
+  vec3 drugColor(uint value) {
+    uint group = value % 8u;
+    if (group == 0u) return vec3(.086,.533,.545);
+    if (group == 1u) return vec3(.224,.478,.659);
+    if (group == 2u) return vec3(.835,.529,.208);
+    if (group == 3u) return vec3(.455,.447,.698);
+    if (group == 4u) return vec3(.722,.361,.439);
+    if (group == 5u) return vec3(.443,.604,.271);
+    if (group == 6u) return vec3(.220,.557,.514);
+    return vec3(.380,.490,.670);
+  }
+  void main() {
+    bool hidden = uKind == 0 && ((aCategory == 1u && !uShowSerious) || (aCategory == 0u && !uShowNonserious));
+    gl_Position = hidden ? vec4(2.,2.,2.,1.) : uMvp * vec4(aPosition, 1.);
+    gl_PointSize = hidden ? 0. : uPointSize * clamp(4.5 / gl_Position.w, .75, 2.5);
+    if (uKind == 0) { vColor = aCategory == 1u ? vec3(.773,.310,.333) : vec3(.224,.478,.659); vBoxed = 0u; }
+    else { vColor = drugColor(aCategory & 127u); vBoxed = aCategory >> 7u; }
+  }`;
+  const POINT_FRAGMENT_SHADER = `#version 300 es
+  precision highp float;
+  in vec3 vColor;
+  flat in uint vBoxed;
+  out vec4 outColor;
+  void main() {
+    float distance = length(gl_PointCoord - vec2(.5));
+    if (distance > .5) discard;
+    vec3 color = vBoxed == 1u && distance > .34 ? vec3(.851,.604,.141) : vColor;
+    float alpha = 1. - smoothstep(.40,.50,distance);
+    outColor = vec4(color, alpha * .92);
+  }`;
+  const EDGE_VERTEX_SHADER = `#version 300 es
+  precision highp float;
+  in vec3 aPosition;
+  uniform mat4 uMvp;
+  void main() { gl_Position = uMvp * vec4(aPosition, 1.); }`;
+  const EDGE_FRAGMENT_SHADER = `#version 300 es
+  precision highp float;
+  uniform float uOpacity;
+  out vec4 outColor;
+  void main() { outColor = vec4(.38,.52,.61,uOpacity); }`;
+  </script>
+</body>
+</html>

@@ -14,6 +14,10 @@ from tekarx.extract import extract_dailymed, extract_drugcentral, extract_faers
 from tekarx.extract.dailymed import DAILYMED_DATASETS
 from tekarx.extract.drugcentral import DEFAULT_DRUGCENTRAL_URL
 from tekarx.extract.faers import resolve_faers_source
+from tekarx.full_visualization import (
+    estimate_full_visualization,
+    export_full_visualization,
+)
 from tekarx.modeling import evaluate_dosage_ablation, train_inductive_gnn
 from tekarx.paths import DataPaths
 from tekarx.studies import FAERS_PRESETS, preset_quarters, write_split_plan
@@ -312,6 +316,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly consume final test labels after model selection",
     )
 
+    estimate_vis = subparsers.add_parser(
+        "estimate-visualization",
+        help="estimate disk and memory requirements for full graph visualization export",
+    )
+    estimate_vis.add_argument(
+        "--data-dir", type=Path, default=Path(os.getenv("TEKARX_DATA_DIR", "data"))
+    )
+    estimate_vis.add_argument(
+        "--graph-dir",
+        type=Path,
+        help="graph checkpoint, array directory, or array manifest",
+    )
+    estimate_vis.add_argument(
+        "--target-shard-size",
+        default="32MB",
+        help="target shard size (e.g. 32MB, 64MB; default: 32MB)",
+    )
+
     visualization = subparsers.add_parser(
         "visualize-graph",
         help="render a memory-safe interactive sample of the patient-drug graph",
@@ -329,15 +351,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     visualization.add_argument(
         "--layout",
-        choices=("2d", "3d"),
-        default="2d",
-        help="interactive rendering mode; default: 2d",
+        choices=("2d", "3d", "hierarchical-bipartite"),
+        default="3d",
+        help="GPU WebGL rendering mode; default: 3d",
     )
-    visualization.add_argument("--patients", type=int, default=100)
-    visualization.add_argument("--top-drugs", type=int, default=50)
+    visualization.add_argument(
+        "--patients",
+        type=int,
+        default=100,
+        help="patients to export (1-1,000,000; default: 100)",
+    )
+    visualization.add_argument(
+        "--top-drugs",
+        type=int,
+        default=50,
+        help="highest-frequency drug nodes to retain (1-100,000; default: 50)",
+    )
+    visualization.add_argument(
+        "--full",
+        action="store_true",
+        help="export complete sharded graph visualization without sampling caps",
+    )
+    visualization.add_argument(
+        "--target-shard-size",
+        default="32MB",
+        help="target shard size for --full export (default: 32MB)",
+    )
+    visualization.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume interrupted --full export by skipping completed shards",
+    )
     visualization.add_argument("--seed", type=int, default=42)
     visualization.add_argument("--output", type=Path)
     return parser
+
 
 
 def _shared_arguments(parser: argparse.ArgumentParser) -> None:
@@ -551,7 +599,30 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(asdict(gnn_record), indent=2, sort_keys=True))
             return 0
+        elif args.command == "estimate-visualization":
+            shard_bytes = _parse_shard_size(args.target_shard_size)
+            estimate_record = estimate_full_visualization(
+                data_dir=paths.root,
+                graph_dir=args.graph_dir,
+                target_shard_bytes=shard_bytes,
+            )
+            print(json.dumps(asdict(estimate_record), indent=2, sort_keys=True))
+            return 0
         elif args.command == "visualize-graph":
+            if args.full:
+                shard_bytes = _parse_shard_size(args.target_shard_size)
+                layout = "hierarchical-bipartite" if args.layout in ("2d", "3d") else args.layout
+                full_record = export_full_visualization(
+                    data_dir=paths.root,
+                    graph_dir=args.graph_dir,
+                    layout=layout,
+                    target_shard_bytes=shard_bytes,
+                    seed=args.seed,
+                    output=args.output,
+                    resume=args.resume,
+                )
+                print(json.dumps(asdict(full_record), indent=2, sort_keys=True))
+                return 0
             visualization_record = visualize_graph(
                 data_dir=paths.root,
                 graph_dir=args.graph_dir,
@@ -564,6 +635,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(asdict(visualization_record), indent=2, sort_keys=True))
             return 0
+
         else:
             _unreachable(args.command)
     except Exception as exc:
@@ -577,5 +649,21 @@ def _unreachable(command: str) -> NoReturn:
     raise AssertionError(f"unhandled command: {command}")
 
 
+def _parse_shard_size(size_str: str | int) -> int:
+    if isinstance(size_str, int):
+        return size_str
+    s = str(size_str).strip().upper()
+    if s.endswith("GB") or s.endswith("GIB"):
+        return int(float(s.rstrip("GIB").rstrip("GB").strip()) * 1024 * 1024 * 1024)
+    if s.endswith("MB") or s.endswith("MIB"):
+        return int(float(s.rstrip("MIB").rstrip("MB").strip()) * 1024 * 1024)
+    if s.endswith("KB") or s.endswith("KIB"):
+        return int(float(s.rstrip("KIB").rstrip("KB").strip()) * 1024)
+    if s.isdigit():
+        return int(s)
+    raise ValueError(f"invalid shard size format: {size_str!r}")
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
+

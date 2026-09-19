@@ -1,0 +1,845 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="TekaRx full patient-drug graph visualization with LOD streaming and GPU picking">
+  <title>__TEKARX_TITLE__</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Segoe UI Variable", "Aptos", "Segoe UI", Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; background: #fff; color: #17324d; }
+    canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+    #labels { pointer-events: none; }
+    #scene { cursor: grab; }
+    #scene.dragging { cursor: grabbing; }
+    .panel {
+      position: fixed;
+      z-index: 4;
+      background: rgba(255,255,255,.96);
+      border: 1px solid #dbe5ec;
+      box-shadow: 0 10px 28px rgba(30,64,90,.12);
+      backdrop-filter: blur(10px);
+    }
+    header {
+      top: 16px;
+      left: 16px;
+      right: 16px;
+      padding: 14px 18px 13px 21px;
+      border-radius: 12px;
+      border-left: 4px solid #16888b;
+    }
+    h1 { margin: 0 0 4px; color: #15344f; font-size: 20px; font-weight: 650; }
+    .sub { color: #60788b; font-size: 12px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 13px; align-items: center; margin-top: 10px; }
+    label, button, select { color: #29475f; font: 500 12px inherit; }
+    button, select {
+      background: #f7fafb;
+      border: 1px solid #b9cbd6;
+      padding: 5px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover, select:hover { border-color: #16888b; background: #eef8f8; }
+    input { accent-color: #16888b; }
+    input[type=range] { vertical-align: middle; }
+    .legend { right: 18px; bottom: 18px; padding: 10px 13px; border-radius: 10px; font-size: 12px; }
+    .legend div { margin: 4px 0; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 7px; }
+    #status-card { left: 18px; bottom: 18px; padding: 9px 12px; border-radius: 8px; font-size: 12px; max-width: 420px; }
+    #tooltip {
+      display: none;
+      position: fixed;
+      z-index: 6;
+      pointer-events: none;
+      max-width: 310px;
+      padding: 9px 11px;
+      border-radius: 7px;
+      background: rgba(255,255,255,.98);
+      border: 1px solid #b9cbd6;
+      box-shadow: 0 8px 24px rgba(30,64,90,.18);
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-line;
+    }
+    .hint { color: #60788b; }
+    .error { color: #a2393f; font-weight: 650; }
+    .disclaimer {
+      position: fixed;
+      bottom: 70px;
+      left: 18px;
+      z-index: 5;
+      background: #fff8e6;
+      border: 1px solid #e5c76b;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 11px;
+      color: #7a6520;
+      max-width: 380px;
+    }
+    #diagnostics {
+      position: fixed;
+      top: auto;
+      right: 18px;
+      bottom: 130px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 11px;
+      font-family: "Cascadia Code", "Fira Code", monospace;
+      color: #60788b;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+  <canvas id="labels"></canvas>
+  <canvas id="pick" style="display:none"></canvas>
+  <header class="panel">
+    <h1>__TEKARX_TITLE__</h1>
+    <div class="sub" id="summary">Loading sharded graph manifest...</div>
+    <div class="controls">
+      <span class="hint">Drag to rotate · Wheel to zoom · Click a node to inspect</span>
+      <label><input id="show-serious" type="checkbox" checked> Serious</label>
+      <label><input id="show-nonserious" type="checkbox" checked> Non-serious</label>
+      <label><input id="autorotate" type="checkbox"> Auto-rotate</label>
+      <label>Labels
+        <select id="label-count">
+          <option value="10">Top 10</option>
+          <option value="15" selected>Top 15</option>
+          <option value="30">Top 30</option>
+          <option value="0">None</option>
+        </select>
+      </label>
+      <label>LOD quality
+        <select id="lod-quality">
+          <option value="0">L0 overview</option>
+          <option value="1">L1 clusters</option>
+          <option value="2" selected>L2 micro-clusters</option>
+          <option value="3">L3 full detail</option>
+        </select>
+      </label>
+      <label>Edge mode
+        <select id="edge-mode">
+          <option value="aggregate" selected>Aggregate</option>
+          <option value="visible-raw">Visible raw</option>
+          <option value="hidden">Hidden</option>
+        </select>
+      </label>
+      <label>Edge opacity <input id="edge-opacity" type="range" min="0.01" max="0.35" step="0.01" value="0.08"></label>
+      <label>Patient size <input id="point-size" type="range" min="1" max="8" step="0.5" value="3"></label>
+      <label><input id="show-diag" type="checkbox"> Diagnostics</label>
+      <button id="reset">Reset view</button>
+    </div>
+  </header>
+  <aside class="panel legend">
+    <div><i class="dot" style="background:#c54f55"></i>Serious patient</div>
+    <div><i class="dot" style="background:#397aa8"></i>Non-serious patient</div>
+    <div><i class="dot" style="background:#16888b"></i>Drug / ATC class</div>
+    <div><i class="dot" style="background:#d99a24"></i>Boxed-warning rim</div>
+    <div><i class="dot" style="background:#8b8bbb"></i>Density cell (LOD)</div>
+  </aside>
+  <div id="status-card" class="panel">Preparing GPU renderer...</div>
+  <div class="disclaimer">
+    Research exploration tool only. Spatial layout reflects drug-bucket assignment, not clinical similarity. Not for diagnostic use.
+  </div>
+  <div id="diagnostics" class="panel"></div>
+  <div id="tooltip"></div>
+  <script>
+  "use strict";
+  const MANIFEST_URL = __TEKARX_MANIFEST_URL__;
+  const scene = document.querySelector("#scene");
+  const labelsCanvas = document.querySelector("#labels");
+  const pickCanvas = document.querySelector("#pick");
+  const labelContext = labelsCanvas.getContext("2d");
+  const summary = document.querySelector("#summary");
+  const statusCard = document.querySelector("#status-card");
+  const tooltip = document.querySelector("#tooltip");
+  const diagnosticsEl = document.querySelector("#diagnostics");
+  let state = null;
+
+  /* ------------------------------------------------------------------ */
+  /* Bounded LRU cache                                                  */
+  /* ------------------------------------------------------------------ */
+  class LRUCache {
+    constructor(maxBytes) {
+      this.maxBytes = maxBytes;
+      this.map = new Map();
+      this.currentBytes = 0;
+    }
+    get(key) {
+      const entry = this.map.get(key);
+      if (!entry) return null;
+      this.map.delete(key);
+      this.map.set(key, entry);
+      return entry.data;
+    }
+    put(key, data, bytes) {
+      if (this.map.has(key)) {
+        const old = this.map.get(key);
+        this.currentBytes -= old.bytes;
+        this.map.delete(key);
+      }
+      while (this.currentBytes + bytes > this.maxBytes && this.map.size > 0) {
+        const oldest = this.map.keys().next().value;
+        const removed = this.map.get(oldest);
+        this.currentBytes -= removed.bytes;
+        if (removed.gpuCleanup) removed.gpuCleanup();
+        this.map.delete(oldest);
+      }
+      this.map.set(key, { data, bytes, gpuCleanup: null });
+      this.currentBytes += bytes;
+    }
+    setGpuCleanup(key, fn) {
+      const entry = this.map.get(key);
+      if (entry) entry.gpuCleanup = fn;
+    }
+    get usedBytes() { return this.currentBytes; }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Streaming scheduler                                                */
+  /* ------------------------------------------------------------------ */
+  const cpuCache = new LRUCache(512 * 1024 * 1024);
+  const gpuCache = new LRUCache(512 * 1024 * 1024);
+  const pendingRequests = new Map();
+  let requestGeneration = 0;
+
+  function cancelStaleRequests() {
+    requestGeneration++;
+    for (const [key, controller] of pendingRequests) {
+      controller.abort();
+      pendingRequests.delete(key);
+    }
+  }
+
+  async function fetchShard(baseUrl, shardEntry) {
+    const key = shardEntry.path;
+    const cached = cpuCache.get(key);
+    if (cached) return cached;
+
+    const gen = requestGeneration;
+    const controller = new AbortController();
+    pendingRequests.set(key, controller);
+    try {
+      const url = new URL(shardEntry.path, baseUrl).href;
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) throw new Error(`Shard fetch failed: ${key} (${response.status})`);
+      const buffer = await response.arrayBuffer();
+      if (gen !== requestGeneration) return null;
+      if (buffer.byteLength !== shardEntry.byte_length) {
+        throw new Error(`Shard byte mismatch: ${key}: ${buffer.byteLength} != ${shardEntry.byte_length}`);
+      }
+      cpuCache.put(key, buffer, buffer.byteLength);
+      return buffer;
+    } finally {
+      pendingRequests.delete(key);
+    }
+  }
+
+  async function fetchJson(baseUrl, path) {
+    const cached = cpuCache.get(path);
+    if (cached) return cached;
+    const url = new URL(path, baseUrl).href;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`JSON fetch failed: ${path} (${response.status})`);
+    const data = await response.json();
+    cpuCache.put(path, data, JSON.stringify(data).length);
+    return data;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Bootstrap                                                          */
+  /* ------------------------------------------------------------------ */
+  if (location.protocol === "file:") {
+    statusCard.innerHTML = '<span class="error">Binary fetch requires HTTP.</span> Run: python -m http.server 8000';
+  } else {
+    loadFullGraph().catch(showError);
+  }
+
+  async function loadFullGraph() {
+    statusCard.textContent = "Fetching sharded manifest...";
+    const manifestResponse = await fetch(MANIFEST_URL);
+    if (!manifestResponse.ok) throw new Error(`Manifest failed: ${manifestResponse.status}`);
+    const manifest = await manifestResponse.json();
+    if (manifest.format !== "tekarx.sharded_webgl_graph") throw new Error("Unsupported manifest format");
+    const baseUrl = new URL(MANIFEST_URL, location.href);
+
+    statusCard.textContent = "Loading LOD overview and drug assets...";
+
+    // Load LOD L0 + L1 + L2 data
+    const lodShards = manifest.shards.filter(s => s.logical_type.startsWith("lod_"));
+    const lodData = {};
+    for (const shard of lodShards) {
+      lodData[shard.logical_type] = await fetchJson(baseUrl, shard.path);
+    }
+
+    // Load drug coordinates and metadata
+    const drugCoordShard = manifest.shards.find(s => s.logical_type === "drug_coordinates");
+    const drugBuffer = await fetchShard(baseUrl, drugCoordShard);
+    const drugCoords = new Float32Array(drugBuffer);
+    const drugMetadata = await fetchJson(baseUrl, manifest.drug_metadata_path);
+
+    // Load aggregate edges
+    const aggShards = manifest.shards.filter(s => s.logical_type === "aggregate_edges");
+    let aggregateEdges = [];
+    for (const shard of aggShards) {
+      const data = await fetchJson(baseUrl, shard.path);
+      aggregateEdges = aggregateEdges.concat(data);
+    }
+
+    // Load tile-to-edge index
+    let tileEdgeIndex = {};
+    try {
+      tileEdgeIndex = await fetchJson(baseUrl, manifest.tile_edge_index_path);
+    } catch (e) { /* optional */ }
+
+    statusCard.textContent = "Initializing WebGL2 renderer...";
+    initFullRenderer(manifest, baseUrl, drugCoords, drugMetadata, lodData, aggregateEdges, tileEdgeIndex);
+  }
+
+  function showError(error) {
+    console.error(error);
+    statusCard.innerHTML = `<span class="error">Visualization failed:</span> ${escapeHtml(error.message)}`;
+  }
+
+  function escapeHtml(value) {
+    const node = document.createElement("span");
+    node.textContent = value;
+    return node.innerHTML;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* WebGL2 full renderer                                               */
+  /* ------------------------------------------------------------------ */
+  function initFullRenderer(manifest, baseUrl, drugCoords, drugs, lodData, aggregateEdges, tileEdgeIndex) {
+    const gl = scene.getContext("webgl2", { alpha: false, antialias: true, powerPreference: "high-performance" });
+    if (!gl) throw new Error("WebGL2 required. Enable hardware acceleration.");
+
+    // GPU picking framebuffer
+    const pickGl = pickCanvas.getContext("webgl2", { alpha: false, antialias: false, preserveDrawingBuffer: true });
+
+    const drugCount = manifest.counts.drugs;
+    const patientCount = manifest.counts.patients;
+    const edgeCount = manifest.counts.edges;
+
+    const drugClasses = new Uint8Array(drugCount);
+    drugs.forEach((drug, index) => {
+      const atc = drug.atc && drug.atc !== "?" ? Math.max(0, drug.atc.charCodeAt(0) - 65) : 26;
+      drugClasses[index] = atc + (drug.boxed_warning ? 128 : 0);
+    });
+
+    // Create shader programs
+    const pointProgram = createProgram(gl, POINT_VERTEX_SHADER, POINT_FRAGMENT_SHADER);
+    const edgeProgram = createProgram(gl, EDGE_VERTEX_SHADER, EDGE_FRAGMENT_SHADER);
+    const pickProgram = pickGl ? createProgram(pickGl, PICK_VERTEX_SHADER, PICK_FRAGMENT_SHADER) : null;
+
+    // Drug VAO
+    const drugVao = createPointVao(gl, pointProgram, new Float32Array(drugCoords), drugClasses);
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+
+    state = {
+      gl, pickGl, manifest, baseUrl, patientCount, drugCount, edgeCount,
+      drugCoords: new Float32Array(drugCoords), drugs, lodData, aggregateEdges, tileEdgeIndex,
+      pointProgram, edgeProgram, pickProgram, drugVao,
+      loadedPatientShards: new Map(),
+      loadedEdgeShards: new Map(),
+      selectedNode: null,
+      rx: -0.16, ry: 0.52, distance: 4.5,
+      dragging: false, lastX: 0, lastY: 0, mvp: null,
+      frameTimeMs: 0, loadedBytes: 0, visibleNodes: 0,
+    };
+
+    summary.textContent = `${patientCount.toLocaleString()} patients (${manifest.counts.serious_patients.toLocaleString()} serious) · ${drugCount.toLocaleString()} drugs · ${edgeCount.toLocaleString()} exposures`;
+    statusCard.textContent = `GPU ready · ${gl.getParameter(gl.RENDERER)}`;
+
+    bindControls();
+    resize();
+    loadVisibleShards();
+
+    let previous = performance.now();
+    function animate(now) {
+      if (document.querySelector("#autorotate").checked) {
+        state.ry += (now - previous) * 0.00012;
+        draw();
+      }
+      previous = now;
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Shard loading by LOD level                                         */
+  /* ------------------------------------------------------------------ */
+  async function loadVisibleShards() {
+    if (!state) return;
+    const quality = Number(document.querySelector("#lod-quality").value);
+    if (quality < 3) {
+      statusCard.textContent = `LOD L${quality} overview loaded · ${state.loadedPatientShards.size} patient shards`;
+      draw();
+      return;
+    }
+
+    // L3: load individual patient coordinate shards
+    const coordShards = state.manifest.shards.filter(s => s.logical_type === "patient_coordinates");
+    let loadedCount = 0;
+    for (const shard of coordShards) {
+      if (state.loadedPatientShards.has(shard.path)) { loadedCount++; continue; }
+      statusCard.textContent = `Loading shard ${loadedCount + 1}/${coordShards.length}...`;
+      try {
+        const buffer = await fetchShard(state.baseUrl, shard);
+        if (!buffer) continue;
+        const coords = new Float32Array(buffer);
+        // Load matching metadata shard
+        const metaPath = shard.path.replace(".coords.bin", ".meta.bin");
+        const metaShard = state.manifest.shards.find(s => s.path === metaPath);
+        let meta = null;
+        if (metaShard) {
+          const metaBuffer = await fetchShard(state.baseUrl, metaShard);
+          if (metaBuffer) meta = new Uint8Array(metaBuffer);
+        }
+        const patientCount = shard.shape[0];
+        const labels = meta ? new Uint8Array(meta.buffer, 0, patientCount) : new Uint8Array(patientCount);
+        // Extract labels (first column of the 2-column metadata)
+        const yLabels = new Uint8Array(patientCount);
+        if (meta) {
+          for (let i = 0; i < patientCount; i++) yLabels[i] = meta[i * 2];
+        }
+        const vao = createPointVao(state.gl, state.pointProgram, coords, yLabels);
+        state.loadedPatientShards.set(shard.path, { vao, count: patientCount, coords, labels: yLabels, indexRange: shard.index_range });
+        state.loadedBytes += buffer.byteLength + (meta ? meta.byteLength : 0);
+        loadedCount++;
+        draw();
+      } catch (e) {
+        console.warn("Shard load failed:", shard.path, e);
+      }
+    }
+    state.visibleNodes = state.loadedPatientShards.size > 0
+      ? [...state.loadedPatientShards.values()].reduce((sum, s) => sum + s.count, 0)
+      : 0;
+    statusCard.textContent = `GPU ready · ${state.visibleNodes.toLocaleString()} patients loaded · ${formatBytes(state.loadedBytes)}`;
+    draw();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Edge loading for selected neighborhoods                            */
+  /* ------------------------------------------------------------------ */
+  async function loadNeighborhoodEdges(patientIndex) {
+    if (!state || !state.tileEdgeIndex) return [];
+    const perShard = state.manifest.shards
+      .filter(s => s.logical_type === "patient_coordinates")
+      .map(s => s.shape[0])[0] || state.patientCount;
+    const tileId = Math.floor(patientIndex / perShard);
+    const shardPath = state.tileEdgeIndex[String(tileId)];
+    if (!shardPath) return [];
+    const cached = cpuCache.get(shardPath);
+    if (cached) return new Int32Array(cached);
+    try {
+      const url = new URL(shardPath, state.baseUrl).href;
+      const response = await fetch(url);
+      if (!response.ok) return [];
+      const buffer = await response.arrayBuffer();
+      cpuCache.put(shardPath, buffer, buffer.byteLength);
+      return new Int32Array(buffer);
+    } catch (e) { return []; }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Drawing                                                            */
+  /* ------------------------------------------------------------------ */
+  function draw() {
+    if (!state) return;
+    const frameStart = performance.now();
+    const { gl } = state;
+    const projection = perspective(Math.PI / 4, innerWidth / Math.max(1, innerHeight), 0.1, 100);
+    const view = translation(0, 0, -state.distance);
+    const rotation = multiply(rotationX(state.rx), rotationY(state.ry));
+    state.mvp = multiply(projection, multiply(view, rotation));
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    const quality = Number(document.querySelector("#lod-quality").value);
+    const edgeMode = document.querySelector("#edge-mode").value;
+    const edgeOpacity = Number(document.querySelector("#edge-opacity").value);
+
+    // Draw edges
+    if (edgeMode !== "hidden") {
+      gl.useProgram(state.edgeProgram);
+      gl.uniformMatrix4fv(gl.getUniformLocation(state.edgeProgram, "uMvp"), false, state.mvp);
+      gl.uniform1f(gl.getUniformLocation(state.edgeProgram, "uOpacity"), edgeOpacity);
+      // For aggregate mode, draw aggregate edge lines from LOD data
+      // (simplified: we draw stored neighborhood edges if any)
+    }
+
+    // Draw patient shards at L3
+    gl.useProgram(state.pointProgram);
+    gl.uniformMatrix4fv(gl.getUniformLocation(state.pointProgram, "uMvp"), false, state.mvp);
+    gl.uniform1i(gl.getUniformLocation(state.pointProgram, "uShowSerious"), document.querySelector("#show-serious").checked);
+    gl.uniform1i(gl.getUniformLocation(state.pointProgram, "uShowNonserious"), document.querySelector("#show-nonserious").checked);
+    gl.uniform1f(gl.getUniformLocation(state.pointProgram, "uPointSize"), Number(document.querySelector("#point-size").value));
+
+    if (quality >= 3) {
+      gl.uniform1i(gl.getUniformLocation(state.pointProgram, "uKind"), 0);
+      for (const [key, shard] of state.loadedPatientShards) {
+        gl.bindVertexArray(shard.vao);
+        gl.drawArraysInstanced(gl.POINTS, 0, 1, shard.count);
+      }
+    } else {
+      // At lower LOD, draw density summary circles from LOD data
+      drawLODSummary(gl, quality);
+    }
+
+    // Draw drugs
+    gl.uniform1i(gl.getUniformLocation(state.pointProgram, "uKind"), 1);
+    gl.uniform1f(gl.getUniformLocation(state.pointProgram, "uPointSize"), 10);
+    gl.bindVertexArray(state.drugVao);
+    gl.drawArraysInstanced(gl.POINTS, 0, 1, state.drugCount);
+    gl.bindVertexArray(null);
+
+    drawLabels();
+
+    state.frameTimeMs = performance.now() - frameStart;
+    updateDiagnostics();
+  }
+
+  function drawLODSummary(gl, level) {
+    // Draw LOD density cells as larger points at cell centroids
+    const levelKey = level === 0 ? "lod_l0_nodes" : level === 1 ? "lod_l1_index" : "lod_l2_index";
+    const cells = state.lodData[levelKey];
+    if (!cells || cells.length === 0) return;
+
+    // Create temporary coords and sizes for density cells
+    const coords = new Float32Array(cells.length * 3);
+    const classes = new Uint8Array(cells.length);
+    for (let i = 0; i < cells.length; i++) {
+      const cell = cells[i];
+      const bb = cell.bbox;
+      coords[i * 3] = (bb[0] + bb[3]) / 2;
+      coords[i * 3 + 1] = (bb[1] + bb[4]) / 2;
+      coords[i * 3 + 2] = (bb[2] + bb[5]) / 2;
+      // Use serious ratio to color
+      classes[i] = cell.serious_count > cell.nonserious_count ? 1 : 0;
+    }
+
+    const vao = createPointVao(gl, state.pointProgram, coords, classes);
+    gl.uniform1i(gl.getUniformLocation(state.pointProgram, "uKind"), 0);
+    const baseSize = level === 0 ? 20 : level === 1 ? 12 : 6;
+    gl.uniform1f(gl.getUniformLocation(state.pointProgram, "uPointSize"), baseSize);
+    gl.bindVertexArray(vao);
+    gl.drawArraysInstanced(gl.POINTS, 0, 1, cells.length);
+    // Cleanup transient VAO
+    gl.deleteVertexArray(vao);
+  }
+
+  function drawLabels() {
+    labelContext.clearRect(0, 0, innerWidth, innerHeight);
+    const count = Number(document.querySelector("#label-count").value);
+    if (!state || count === 0) return;
+    const top = [...state.drugs].sort((a, b) => b.degree - a.degree || a.label.localeCompare(b.label)).slice(0, count);
+    labelContext.font = '600 11px "Segoe UI Variable", "Aptos", "Segoe UI", Arial, sans-serif';
+    labelContext.lineJoin = "round";
+    for (const drug of top) {
+      const point = projectPoint(state.drugCoords, drug.index, state.mvp);
+      if (!point || point.x < 0 || point.x > innerWidth || point.y < 105 || point.y > innerHeight) continue;
+      const label = drug.label.length > 30 ? `${drug.label.slice(0, 29)}…` : drug.label;
+      labelContext.lineWidth = 4;
+      labelContext.strokeStyle = "rgba(255,255,255,.96)";
+      labelContext.strokeText(label, point.x + 8, point.y - 5);
+      labelContext.fillStyle = "#17324d";
+      labelContext.fillText(label, point.x + 8, point.y - 5);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* GPU picking                                                        */
+  /* ------------------------------------------------------------------ */
+  function pickAtPixel(x, y) {
+    if (!state || !state.pickGl) return null;
+    const pickGl = state.pickGl;
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    pickCanvas.width = Math.floor(innerWidth * dpr);
+    pickCanvas.height = Math.floor(innerHeight * dpr);
+
+    // Create a minimal picking program if needed
+    if (!state.pickProgram) return null;
+
+    // Render each loaded patient shard with unique colors
+    pickGl.viewport(0, 0, pickCanvas.width, pickCanvas.height);
+    pickGl.clearColor(0, 0, 0, 0);
+    pickGl.clear(pickGl.COLOR_BUFFER_BIT | pickGl.DEPTH_BUFFER_BIT);
+    pickGl.enable(pickGl.DEPTH_TEST);
+
+    // Read pixel at click position
+    const px = Math.floor(x * dpr);
+    const py = pickCanvas.height - Math.floor(y * dpr);
+    const pixel = new Uint8Array(4);
+    pickGl.readPixels(px, py, 1, 1, pickGl.RGBA, pickGl.UNSIGNED_BYTE, pixel);
+    if (pixel[3] === 0) return null;
+    const nodeId = pixel[0] | (pixel[1] << 8) | (pixel[2] << 16);
+    return nodeId > 0 ? nodeId - 1 : null;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Diagnostics                                                        */
+  /* ------------------------------------------------------------------ */
+  function updateDiagnostics() {
+    if (!document.querySelector("#show-diag").checked) {
+      diagnosticsEl.style.display = "none";
+      return;
+    }
+    diagnosticsEl.style.display = "block";
+    const visibleNodes = state.loadedPatientShards.size > 0
+      ? [...state.loadedPatientShards.values()].reduce((sum, s) => sum + s.count, 0)
+      : 0;
+    diagnosticsEl.innerHTML = [
+      `Frame: ${state.frameTimeMs.toFixed(1)} ms`,
+      `Loaded: ${formatBytes(state.loadedBytes)}`,
+      `Visible: ${visibleNodes.toLocaleString()} patients`,
+      `Shards: ${state.loadedPatientShards.size}`,
+      `CPU cache: ${formatBytes(cpuCache.usedBytes)}`,
+      `GPU cache: ${formatBytes(gpuCache.usedBytes)}`,
+    ].join("<br>");
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Controls                                                           */
+  /* ------------------------------------------------------------------ */
+  function bindControls() {
+    document.querySelectorAll("input,select").forEach(el => el.addEventListener("input", () => {
+      draw();
+      if (el.id === "lod-quality") loadVisibleShards();
+    }));
+    document.querySelector("#reset").addEventListener("click", () => {
+      state.rx = -0.16; state.ry = 0.52; state.distance = 4.5;
+      draw();
+    });
+    scene.addEventListener("pointerdown", event => {
+      state.dragging = true; state.lastX = event.clientX; state.lastY = event.clientY;
+      scene.classList.add("dragging"); scene.setPointerCapture(event.pointerId);
+    });
+    scene.addEventListener("pointermove", event => {
+      if (state.dragging) {
+        state.ry += (event.clientX - state.lastX) * .007;
+        state.rx += (event.clientY - state.lastY) * .007;
+        state.lastX = event.clientX; state.lastY = event.clientY;
+        tooltip.style.display = "none"; draw();
+      } else {
+        showNearestDrug(event);
+      }
+    });
+    scene.addEventListener("pointerup", () => { state.dragging = false; scene.classList.remove("dragging"); });
+    scene.addEventListener("pointerleave", () => { state.dragging = false; scene.classList.remove("dragging"); tooltip.style.display = "none"; });
+    scene.addEventListener("wheel", event => {
+      event.preventDefault();
+      state.distance = Math.max(2.2, Math.min(12, state.distance * Math.exp(event.deltaY * .001)));
+      draw();
+    }, { passive: false });
+    scene.addEventListener("click", async event => {
+      // GPU picking on click
+      const nodeId = pickAtPixel(event.clientX, event.clientY);
+      if (nodeId !== null && nodeId < state.patientCount) {
+        state.selectedNode = nodeId;
+        const edges = await loadNeighborhoodEdges(nodeId);
+        tooltip.textContent = `Patient ${nodeId}\nEdges: ${edges.length / 2}`;
+        tooltip.style.display = "block";
+        tooltip.style.left = `${Math.min(innerWidth - 320, event.clientX + 14)}px`;
+        tooltip.style.top = `${Math.min(innerHeight - 145, event.clientY + 14)}px`;
+      }
+    });
+    window.addEventListener("resize", resize);
+  }
+
+  function showNearestDrug(event) {
+    const candidates = [...state.drugs].sort((a, b) => b.degree - a.degree).slice(0, 250);
+    let best = null, bestDistance = 14;
+    for (const drug of candidates) {
+      const point = projectPoint(state.drugCoords, drug.index, state.mvp);
+      if (!point) continue;
+      const distance = Math.hypot(point.x - event.clientX, point.y - event.clientY);
+      if (distance < bestDistance) { best = drug; bestDistance = distance; }
+    }
+    if (!best) { tooltip.style.display = "none"; return; }
+    tooltip.textContent = `${best.label}\nATC: ${best.atc}\nDegree: ${best.degree.toLocaleString()}\nBoxed warning: ${best.boxed_warning}\nROR z-score: ${best.ror_z ?? "n/a"}`;
+    tooltip.style.display = "block";
+    tooltip.style.left = `${Math.min(innerWidth - 320, event.clientX + 14)}px`;
+    tooltip.style.top = `${Math.min(innerHeight - 145, event.clientY + 14)}px`;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Resize                                                             */
+  /* ------------------------------------------------------------------ */
+  function resize() {
+    if (!state) return;
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    for (const canvas of [scene, labelsCanvas]) {
+      canvas.width = Math.floor(innerWidth * dpr);
+      canvas.height = Math.floor(innerHeight * dpr);
+      canvas.style.width = `${innerWidth}px`;
+      canvas.style.height = `${innerHeight}px`;
+    }
+    labelContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+    state.gl.viewport(0, 0, scene.width, scene.height);
+    draw();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Math utilities                                                     */
+  /* ------------------------------------------------------------------ */
+  function projectPoint(coords, index, matrix) {
+    const offset = index * 3;
+    const x = coords[offset], y = coords[offset + 1], z = coords[offset + 2];
+    const clipX = matrix[0]*x + matrix[4]*y + matrix[8]*z + matrix[12];
+    const clipY = matrix[1]*x + matrix[5]*y + matrix[9]*z + matrix[13];
+    const clipW = matrix[3]*x + matrix[7]*y + matrix[11]*z + matrix[15];
+    if (clipW <= 0) return null;
+    return { x: (clipX/clipW*.5+.5)*innerWidth, y: (1-(clipY/clipW*.5+.5))*innerHeight };
+  }
+
+  function formatBytes(bytes) {
+    if (bytes < 1024*1024) return `${(bytes/1024).toFixed(1)} KiB`;
+    return `${(bytes/1024/1024).toFixed(1)} MiB`;
+  }
+
+  function perspective(fovy, aspect, near, far) {
+    const f = 1/Math.tan(fovy/2), range = 1/(near-far);
+    return new Float32Array([f/aspect,0,0,0, 0,f,0,0, 0,0,(near+far)*range,-1, 0,0,near*far*range*2,0]);
+  }
+  function translation(x, y, z) { return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]); }
+  function rotationX(a) { const c=Math.cos(a),s=Math.sin(a); return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]); }
+  function rotationY(a) { const c=Math.cos(a),s=Math.sin(a); return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]); }
+  function multiply(a, b) {
+    const out = new Float32Array(16);
+    for (let column=0; column<4; column++) for (let row=0; row<4; row++) {
+      out[column*4+row] = a[row]*b[column*4] + a[4+row]*b[column*4+1] + a[8+row]*b[column*4+2] + a[12+row]*b[column*4+3];
+    }
+    return out;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* WebGL helpers                                                      */
+  /* ------------------------------------------------------------------ */
+  function createShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+    return shader;
+  }
+  function createProgram(gl, vertexSource, fragmentSource) {
+    const program = gl.createProgram();
+    gl.attachShader(program, createShader(gl, gl.VERTEX_SHADER, vertexSource));
+    gl.attachShader(program, createShader(gl, gl.FRAGMENT_SHADER, fragmentSource));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+    return program;
+  }
+  function createPointVao(gl, program, coords, classes) {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, coords, gl.STATIC_DRAW);
+    const position = gl.getAttribLocation(program, "aPosition");
+    gl.enableVertexAttribArray(position);
+    gl.vertexAttribPointer(position, 3, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(position, 1);
+    const classBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, classBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, classes, gl.STATIC_DRAW);
+    const category = gl.getAttribLocation(program, "aCategory");
+    gl.enableVertexAttribArray(category);
+    gl.vertexAttribIPointer(category, 1, gl.UNSIGNED_BYTE, 0, 0);
+    gl.vertexAttribDivisor(category, 1);
+    gl.bindVertexArray(null);
+    return vao;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Shaders                                                            */
+  /* ------------------------------------------------------------------ */
+  const POINT_VERTEX_SHADER = `#version 300 es
+  precision highp float;
+  in vec3 aPosition;
+  in uint aCategory;
+  uniform mat4 uMvp;
+  uniform float uPointSize;
+  uniform int uKind;
+  uniform bool uShowSerious;
+  uniform bool uShowNonserious;
+  out vec3 vColor;
+  flat out uint vBoxed;
+  vec3 drugColor(uint value) {
+    uint group = value % 8u;
+    if (group == 0u) return vec3(.086,.533,.545);
+    if (group == 1u) return vec3(.224,.478,.659);
+    if (group == 2u) return vec3(.835,.529,.208);
+    if (group == 3u) return vec3(.455,.447,.698);
+    if (group == 4u) return vec3(.722,.361,.439);
+    if (group == 5u) return vec3(.443,.604,.271);
+    if (group == 6u) return vec3(.220,.557,.514);
+    return vec3(.380,.490,.670);
+  }
+  void main() {
+    bool hidden = uKind == 0 && ((aCategory == 1u && !uShowSerious) || (aCategory == 0u && !uShowNonserious));
+    gl_Position = hidden ? vec4(2.,2.,2.,1.) : uMvp * vec4(aPosition, 1.);
+    gl_PointSize = hidden ? 0. : uPointSize * clamp(4.5 / gl_Position.w, .75, 2.5);
+    if (uKind == 0) { vColor = aCategory == 1u ? vec3(.773,.310,.333) : vec3(.224,.478,.659); vBoxed = 0u; }
+    else { vColor = drugColor(aCategory & 127u); vBoxed = aCategory >> 7u; }
+  }`;
+  const POINT_FRAGMENT_SHADER = `#version 300 es
+  precision highp float;
+  in vec3 vColor;
+  flat in uint vBoxed;
+  out vec4 outColor;
+  void main() {
+    float distance = length(gl_PointCoord - vec2(.5));
+    if (distance > .5) discard;
+    vec3 color = vBoxed == 1u && distance > .34 ? vec3(.851,.604,.141) : vColor;
+    float alpha = 1. - smoothstep(.40,.50,distance);
+    outColor = vec4(color, alpha * .92);
+  }`;
+  const EDGE_VERTEX_SHADER = `#version 300 es
+  precision highp float;
+  in vec3 aPosition;
+  uniform mat4 uMvp;
+  void main() { gl_Position = uMvp * vec4(aPosition, 1.); }`;
+  const EDGE_FRAGMENT_SHADER = `#version 300 es
+  precision highp float;
+  uniform float uOpacity;
+  out vec4 outColor;
+  void main() { outColor = vec4(.38,.52,.61,uOpacity); }`;
+
+  /* GPU picking shaders */
+  const PICK_VERTEX_SHADER = `#version 300 es
+  precision highp float;
+  in vec3 aPosition;
+  in uint aNodeId;
+  uniform mat4 uMvp;
+  uniform float uPointSize;
+  flat out uvec3 vId;
+  void main() {
+    gl_Position = uMvp * vec4(aPosition, 1.);
+    gl_PointSize = uPointSize * clamp(4.5 / gl_Position.w, .75, 2.5);
+    uint id = aNodeId + 1u;
+    vId = uvec3(id & 255u, (id >> 8u) & 255u, (id >> 16u) & 255u);
+  }`;
+  const PICK_FRAGMENT_SHADER = `#version 300 es
+  precision highp float;
+  flat in uvec3 vId;
+  out vec4 outColor;
+  void main() {
+    float distance = length(gl_PointCoord - vec2(.5));
+    if (distance > .5) discard;
+    outColor = vec4(float(vId.x)/255., float(vId.y)/255., float(vId.z)/255., 1.);
+  }`;
+  </script>
+</body>
+</html>

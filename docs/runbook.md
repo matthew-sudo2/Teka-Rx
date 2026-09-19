@@ -455,31 +455,46 @@ incremental dosage package (relative amount/daily-dose, availability, scheduling
 parenteral features) but leaves the existing coarse exposure fields and the rest of the prospective
 graph feature set unchanged.
 
-#### Visualize a sampled patient-drug graph
+#### Visualize up to one million patient-drug records
 
-Do not try to lay out the complete graph. Render a deterministic, bounded bipartite sample instead:
+Export a deterministic binary WebGL bundle without loading the source graph into RAM:
 
 ```powershell
 tekarx visualize-graph --split validation --patients 100 --top-drugs 50
 ```
 
-Add `--layout 3d` for a canvas-based depth projection with drag rotation, wheel zoom,
-auto-rotation, depth-aware node sizing, top-drug labels, and hover-neighborhood isolation. The
-label selector can switch between the 15 highest-degree drugs, every displayed node, or no labels.
-The standalone renderer uses a white clinical-dashboard surface, restrained navy/teal colors,
-professional system UI fonts, and depth shadows rather than a dark visualization theme.
+The default is a WebGL2 3D projection. A million selected patients normally requires the training
+split because validation and test contain fewer records:
 
-The standalone `data/processed/graph_visualization.html` supports hover-neighborhood highlighting,
-serious/non-serious filters, drug-degree sizing, ATC tooltips, and boxed-warning borders. Numeric
-arrays are opened with NumPy memory mapping. `--graph-dir` can point to a graph checkpoint, its
-`tekarx_graph_arrays` directory, or `manifest.json`. The renderer requires only patient IDs,
-targets, split IDs, edge indices, drug metadata, and optionally `drug_x`; `patient_x` is not read.
+```powershell
+tekarx visualize-graph --split train --patients 1000000 --top-drugs 5000 `
+  --output data/processed/graph_1m.html
+cd data/processed
+python -m http.server 8000
+```
+
+Open `http://localhost:8000/graph_1m.html`. Directly opening the HTML with `file://` does not work
+because browsers block asynchronous binary `fetch` requests from local files.
+
+Python performs an offline static bipartite projection, writes `patient_coords.bin`,
+`drug_coords.bin`, Uint8 target/split buffers, packed Int32 `edges.bin`, drug metadata, and a compact
+manifest in the sibling `_assets` directory. The HTML contains no patient or edge JSON. WebGL2
+uploads typed arrays directly and uses instanced point particles, with optional edge fractions for
+slower GPUs. Labels are limited to top drugs to avoid DOM/text work proportional to patient count.
+The geometric layout is deterministic but is not a UMAP embedding, model explanation, or clinical
+similarity metric.
+
+Source arrays remain NumPy memory maps. Patient selection uses two chunked passes and edge export
+uses two more passes: the first freezes top-drug frequencies and the second writes remapped edges.
+Approximate binary size is `14 * patients + 8 * retained_edges + 12 * drugs` bytes. Browser memory
+is higher because coordinates also occupy GPU buffers. `--graph-dir` can point to a graph checkpoint,
+its `tekarx_graph_arrays` directory, or `manifest.json`; `patient_x` is never read.
 
 To visualize the verified full checkpoint in Google Colab without copying its 3.86 GB patient
 feature matrix, run [`notebooks/visualize_full_graph_colab.ipynb`](../notebooks/visualize_full_graph_colab.ipynb).
 The notebook validates `_GRAPH_SUCCESS.json`, restores the exact full topology needed by the
-renderer with progress bars, reports sample-to-full percentages, and checkpoints the standalone
-HTML and JSON manifest in Drive.
+renderer with progress bars, reports selection-to-full percentages, previews the bundle over HTTP,
+and checkpoints the HTML, binary asset directory, and provenance JSON in Drive.
 
 ### Run the feature-rescue package
 

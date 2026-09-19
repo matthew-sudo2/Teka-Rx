@@ -1,19 +1,23 @@
-# ruff: noqa: E501
-"""Memory-safe, self-contained visualization of sampled patient-drug graphs."""
+"""Memory-bounded binary export for GPU patient-drug graph visualization."""
 
 from __future__ import annotations
 
-import html
 import json
-from collections import Counter
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pyarrow.parquet as pq
+from tqdm import tqdm
 
 SPLIT_IDS = {"train": 0, "validation": 1, "test": 2}
+MAX_VISUALIZATION_PATIENTS = 1_000_000
+MAX_VISUALIZATION_DRUGS = 100_000
+EDGE_SCAN_CHUNK_SIZE = 1_000_000
+PATIENT_WRITE_CHUNK_SIZE = 1_000_000
 REQUIRED_ARRAYS = (
     "patient_primaryid",
     "patient_y",
@@ -29,10 +33,12 @@ class GraphVisualizationError(RuntimeError):
 
 @dataclass(frozen=True)
 class GraphVisualizationRecord:
-    """Summary of a rendered graph sample."""
+    """Summary of an exported browser visualization."""
 
     output_path: str
     array_manifest_path: str
+    visualization_manifest_path: str
+    asset_directory: str
     split: str
     layout: str
     requested_patients: int
@@ -44,6 +50,7 @@ class GraphVisualizationRecord:
     graph_patient_nodes: int
     graph_drug_nodes: int
     graph_edges: int
+    binary_bytes: int
     seed: int
 
 
@@ -52,44 +59,41 @@ def visualize_graph(
     data_dir: Path,
     graph_dir: Path | None = None,
     split: str = "validation",
-    layout: str = "2d",
+    layout: str = "3d",
     patients: int = 100,
     top_drugs: int = 50,
     seed: int = 42,
     output: Path | None = None,
 ) -> GraphVisualizationRecord:
-    """Render a bounded patient-drug sample as standalone interactive HTML.
+    """Export a static-layout graph as typed binary buffers plus WebGL2 HTML.
 
-    Only the topology, split, target, patient-ID, and drug-metadata arrays are
-    opened. All NumPy arrays remain memory-mapped, so a full graph does not need
-    to fit in RAM.
+    Source graph arrays remain memory-mapped. Patient selection and edge
+    remapping are vectorized in bounded chunks, and the browser receives no
+    million-element JSON structures.
     """
     if split not in SPLIT_IDS:
         raise ValueError(f"split must be one of {tuple(SPLIT_IDS)}")
     if layout not in ("2d", "3d"):
         raise ValueError("layout must be '2d' or '3d'")
-    if not 1 <= patients <= 500:
-        raise ValueError("patients must be between 1 and 500")
-    if not 1 <= top_drugs <= 250:
-        raise ValueError("top_drugs must be between 1 and 250")
+    if not 1 <= patients <= MAX_VISUALIZATION_PATIENTS:
+        raise ValueError(f"patients must be between 1 and {MAX_VISUALIZATION_PATIENTS}")
+    if not 1 <= top_drugs <= MAX_VISUALIZATION_DRUGS:
+        raise ValueError(f"top_drugs must be between 1 and {MAX_VISUALIZATION_DRUGS}")
 
     data_root = Path(data_dir).resolve()
-    manifest_path = _resolve_array_manifest(data_root, graph_dir)
-    manifest = _read_manifest(manifest_path)
+    source_manifest_path = _resolve_array_manifest(data_root, graph_dir)
+    source_manifest = _read_manifest(source_manifest_path)
     arrays = {
-        name: _load_array(manifest_path, manifest, name)
-        for name in REQUIRED_ARRAYS
+        name: _load_array(source_manifest_path, source_manifest, name) for name in REQUIRED_ARRAYS
     }
-    drug_x = _load_array(manifest_path, manifest, "drug_x", required=False)
+    drug_x = _load_array(source_manifest_path, source_manifest, "drug_x", required=False)
+    patient_count = _validate_source_arrays(arrays)
+    counts = source_manifest.get("counts", {})
+    graph_drug_count = int(counts.get("drug_nodes", int(np.max(arrays["edge_drug_index"])) + 1))
+    if graph_drug_count < 1:
+        raise GraphVisualizationError("source graph has no drug nodes")
 
-    patient_count = int(arrays["patient_y"].shape[0])
-    if arrays["patient_primaryid"].shape != (patient_count,):
-        raise GraphVisualizationError("patient ID and target arrays have different lengths")
-    if arrays["patient_split_id"].shape != (patient_count,):
-        raise GraphVisualizationError("patient split and target arrays have different lengths")
-    if arrays["edge_patient_index"].shape != arrays["edge_drug_index"].shape:
-        raise GraphVisualizationError("patient and drug edge arrays have different lengths")
-
+    print("Visualization 1/5: selecting patients with bounded memory", flush=True)
     selected = _sample_patient_indices(
         arrays["patient_split_id"],
         arrays["patient_y"],
@@ -97,60 +101,18 @@ def visualize_graph(
         count=patients,
         seed=seed,
     )
-    sampled_edges = _edges_for_patients(
+    print("Visualization 2/5: scanning selected exposure frequencies", flush=True)
+    frequencies = _selected_drug_frequencies(
         arrays["edge_patient_index"],
         arrays["edge_drug_index"],
         selected,
-        manifest=manifest,
+        graph_drug_count=graph_drug_count,
+        manifest=source_manifest,
         split=split,
     )
-    if not sampled_edges:
+    kept_drugs = _highest_frequency_drugs(frequencies, top_drugs)
+    if kept_drugs.size == 0:
         raise GraphVisualizationError(f"sampled {split} patients have no drug edges")
-
-    frequencies = Counter(drug for _patient, drug in sampled_edges)
-    kept_drugs = {
-        drug
-        for drug, _degree in sorted(
-            frequencies.items(), key=lambda item: (-item[1], item[0])
-        )[:top_drugs]
-    }
-    kept_edges = sorted(
-        {(patient, drug) for patient, drug in sampled_edges if drug in kept_drugs}
-    )
-    kept_patients = sorted({patient for patient, _drug in kept_edges})
-    if not kept_patients:
-        raise GraphVisualizationError("top-drug filtering removed every sampled patient")
-
-    drug_metadata = _read_drug_metadata(manifest_path, manifest)
-    drug_names = _drugcentral_names(data_root, kept_drugs, drug_metadata)
-    patient_nodes = [
-        {
-            "id": f"p:{index}",
-            "index": index,
-            "primaryid": str(int(arrays["patient_primaryid"][index])),
-            "serious": int(arrays["patient_y"][index]),
-        }
-        for index in kept_patients
-    ]
-    drug_nodes = []
-    for index in sorted(kept_drugs, key=lambda value: (-frequencies[value], value)):
-        metadata = drug_metadata.get(index, {})
-        features = _describe_drug_features(drug_x, index)
-        drug_nodes.append(
-            {
-                "id": f"d:{index}",
-                "index": index,
-                "label": drug_names.get(index) or str(metadata.get("node_label", f"Drug {index}")),
-                "semantic_id": int(metadata.get("semantic_id", 0)),
-                "kind": str(metadata.get("node_kind", "unknown")),
-                "degree": frequencies[index],
-                **features,
-            }
-        )
-    edges = [
-        {"source": f"p:{patient}", "target": f"d:{drug}"}
-        for patient, drug in kept_edges
-    ]
 
     default_name = "graph_visualization_3d.html" if layout == "3d" else "graph_visualization.html"
     output_path = Path(output or data_root / "processed" / default_name)
@@ -158,57 +120,442 @@ def visualize_graph(
         output_path = Path.cwd() / output_path
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "split": split,
-        "source_manifest": str(manifest_path),
-        "patients": patient_nodes,
-        "drugs": drug_nodes,
-        "edges": edges,
-    }
-    temporary = output_path.with_suffix(output_path.suffix + ".tmp")
-    temporary.write_text(_render_html(payload, layout=layout), encoding="utf-8")
-    temporary.replace(output_path)
+    asset_directory = output_path.parent / f"{output_path.stem}_assets"
+    asset_directory.mkdir(parents=True, exist_ok=True)
 
-    counts = manifest.get("counts", {})
+    print("Visualization 3/5: writing offline coordinates and metadata", flush=True)
+    patient_coords_path = asset_directory / "patient_coords.bin"
+    drug_coords_path = asset_directory / "drug_coords.bin"
+    patient_y_path = asset_directory / "patient_y.bin"
+    patient_split_path = asset_directory / "patient_split_id.bin"
+    _write_patient_coordinates(
+        patient_coords_path,
+        arrays["patient_y"],
+        selected,
+        seed=seed,
+        layout=layout,
+    )
+    _write_drug_coordinates(drug_coords_path, kept_drugs.size, layout=layout)
+    _write_selected_uint8(patient_y_path, arrays["patient_y"], selected)
+    _write_selected_uint8(patient_split_path, arrays["patient_split_id"], selected)
+
+    drug_global_to_local = np.full(graph_drug_count, -1, dtype=np.int32)
+    drug_global_to_local[kept_drugs] = np.arange(kept_drugs.size, dtype=np.int32)
+    rendered_edge_count = int(frequencies[kept_drugs].sum(dtype=np.int64))
+    print(
+        f"Visualization 4/5: streaming {rendered_edge_count:,} remapped edges",
+        flush=True,
+    )
+    edges_path = asset_directory / "edges.bin"
+    _write_edge_indices(
+        edges_path,
+        arrays["edge_patient_index"],
+        arrays["edge_drug_index"],
+        selected,
+        drug_global_to_local,
+        expected_edges=rendered_edge_count,
+        manifest=source_manifest,
+        split=split,
+    )
+
+    drug_metadata = _read_drug_metadata(source_manifest_path, source_manifest)
+    drug_names = _drugcentral_names(data_root, set(map(int, kept_drugs)), drug_metadata)
+    rendered_drug_metadata = _rendered_drug_metadata(
+        kept_drugs, frequencies, drug_metadata, drug_names, drug_x
+    )
+    drug_metadata_path = asset_directory / "drug_metadata.json"
+    _write_json_atomic(drug_metadata_path, rendered_drug_metadata, compact=True)
+
+    assets = {
+        "patient_coords": _binary_metadata(patient_coords_path, "float32", [selected.size, 3]),
+        "drug_coords": _binary_metadata(drug_coords_path, "float32", [kept_drugs.size, 3]),
+        "patient_y": _binary_metadata(patient_y_path, "uint8", [selected.size]),
+        "patient_split_id": _binary_metadata(patient_split_path, "uint8", [selected.size]),
+        "edges": _binary_metadata(edges_path, "int32", [rendered_edge_count, 2]),
+    }
+    visualization_manifest_path = asset_directory / "manifest.json"
+    visualization_manifest = {
+        "format": "tekarx.webgl_graph",
+        "format_version": 1,
+        "intended_use": "research exploration; not diagnosis",
+        "split": split,
+        "layout": layout,
+        "seed": seed,
+        "counts": {
+            "patients": int(selected.size),
+            "drugs": int(kept_drugs.size),
+            "edges": rendered_edge_count,
+            "serious_patients": int(
+                np.count_nonzero(np.asarray(arrays["patient_y"])[selected] == 1)
+            ),
+        },
+        "arrays": assets,
+        "edge_encoding": ("row-major [patient_local_index, patient_count + drug_local_index]"),
+        "drug_metadata_path": drug_metadata_path.name,
+        "source": {
+            "graph_manifest": str(source_manifest_path),
+            "graph_counts": {
+                "patients": int(counts.get("patient_nodes", patient_count)),
+                "drugs": graph_drug_count,
+                "edges": int(
+                    counts.get("patient_drug_edges", arrays["edge_patient_index"].shape[0])
+                ),
+            },
+        },
+    }
+    _write_json_atomic(visualization_manifest_path, visualization_manifest, compact=True)
+
+    relative_manifest = Path(
+        Path(asset_directory).relative_to(output_path.parent), "manifest.json"
+    ).as_posix()
+    print("Visualization 5/5: writing WebGL2 launcher and provenance", flush=True)
+    _write_text_atomic(
+        output_path,
+        _render_webgl_html(split=split, layout=layout, manifest_url=relative_manifest),
+    )
+
+    serious_count = int(visualization_manifest["counts"]["serious_patients"])
+    binary_bytes = sum(
+        path.stat().st_size
+        for path in (
+            patient_coords_path,
+            drug_coords_path,
+            patient_y_path,
+            patient_split_path,
+            edges_path,
+        )
+    )
     record = GraphVisualizationRecord(
         output_path=str(output_path),
-        array_manifest_path=str(manifest_path),
+        array_manifest_path=str(source_manifest_path),
+        visualization_manifest_path=str(visualization_manifest_path),
+        asset_directory=str(asset_directory),
         split=split,
         layout=layout,
         requested_patients=patients,
-        rendered_patients=len(patient_nodes),
-        rendered_drugs=len(drug_nodes),
-        rendered_edges=len(edges),
-        serious_patients=sum(node["serious"] for node in patient_nodes),
-        nonserious_patients=sum(1 - node["serious"] for node in patient_nodes),
+        rendered_patients=int(selected.size),
+        rendered_drugs=int(kept_drugs.size),
+        rendered_edges=rendered_edge_count,
+        serious_patients=serious_count,
+        nonserious_patients=int(selected.size) - serious_count,
         graph_patient_nodes=int(counts.get("patient_nodes", patient_count)),
-        graph_drug_nodes=int(counts.get("drug_nodes", len(drug_metadata))),
+        graph_drug_nodes=graph_drug_count,
         graph_edges=int(counts.get("patient_drug_edges", arrays["edge_patient_index"].shape[0])),
+        binary_bytes=binary_bytes,
         seed=seed,
     )
-    manifest_output = output_path.with_suffix(".json")
-    manifest_output.write_text(
-        json.dumps(
-            {
-                "dataset": "TekaRx sampled patient-drug graph visualization",
-                "intended_use": "research exploration; not diagnosis",
-                "sampling": "seeded, approximately class-balanced patient sample",
-                "record": asdict(record),
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_json_atomic(
+        output_path.with_suffix(".json"),
+        {
+            "dataset": "TekaRx patient-drug WebGL visualization",
+            "intended_use": "research exploration; not diagnosis",
+            "sampling": "seeded systematic, approximately class-balanced patient sample",
+            "record": asdict(record),
+        },
     )
     return record
+
+
+def _validate_source_arrays(arrays: dict[str, np.ndarray]) -> int:
+    patient_count = int(arrays["patient_y"].shape[0])
+    if arrays["patient_primaryid"].shape != (patient_count,):
+        raise GraphVisualizationError("patient ID and target arrays have different lengths")
+    if arrays["patient_split_id"].shape != (patient_count,):
+        raise GraphVisualizationError("patient split and target arrays have different lengths")
+    if arrays["edge_patient_index"].shape != arrays["edge_drug_index"].shape:
+        raise GraphVisualizationError("patient and drug edge arrays have different lengths")
+    return patient_count
+
+
+def _sample_patient_indices(
+    split_ids: np.ndarray,
+    labels: np.ndarray,
+    *,
+    split_id: int,
+    count: int,
+    seed: int,
+) -> np.ndarray:
+    """Return a deterministic, systematic, approximately balanced sample.
+
+    This uses two chunked passes and O(sample-size) memory. It avoids a Python
+    set with one million integer objects and does not materialize all eligible
+    patient indices.
+    """
+    capacities = np.zeros(2, dtype=np.int64)
+    for start in range(0, split_ids.shape[0], PATIENT_WRITE_CHUNK_SIZE):
+        stop = min(start + PATIENT_WRITE_CHUNK_SIZE, split_ids.shape[0])
+        chunk_splits = np.asarray(split_ids[start:stop])
+        chunk_labels = np.asarray(labels[start:stop])
+        eligible = chunk_splits == split_id
+        capacities += np.bincount(chunk_labels[eligible].astype(np.int64, copy=False), minlength=2)[
+            :2
+        ]
+    available = int(capacities.sum())
+    if available == 0:
+        raise GraphVisualizationError("selected graph split has no patients")
+    requested = min(count, available)
+    targets = np.array([requested - requested // 2, requested // 2], dtype=np.int64)
+    targets = np.minimum(targets, capacities)
+    remaining = requested - int(targets.sum())
+    for label in np.argsort(-(capacities - targets)):
+        addition = min(remaining, int(capacities[label] - targets[label]))
+        targets[label] += addition
+        remaining -= addition
+        if remaining == 0:
+            break
+
+    rng = np.random.default_rng(seed)
+    desired_ranks: list[np.ndarray] = []
+    for label in (0, 1):
+        target = int(targets[label])
+        capacity = int(capacities[label])
+        if target == 0:
+            desired_ranks.append(np.empty(0, dtype=np.int64))
+            continue
+        phase = float(rng.random())
+        ranks = np.floor((np.arange(target, dtype=np.float64) + phase) * capacity / target).astype(
+            np.int64
+        )
+        desired_ranks.append(np.minimum(ranks, capacity - 1))
+
+    selected_by_label = [np.empty(int(targets[label]), dtype=np.int64) for label in (0, 1)]
+    written = np.zeros(2, dtype=np.int64)
+    seen = np.zeros(2, dtype=np.int64)
+    for start in range(0, split_ids.shape[0], PATIENT_WRITE_CHUNK_SIZE):
+        stop = min(start + PATIENT_WRITE_CHUNK_SIZE, split_ids.shape[0])
+        chunk_splits = np.asarray(split_ids[start:stop])
+        chunk_labels = np.asarray(labels[start:stop])
+        for label in (0, 1):
+            local = np.flatnonzero((chunk_splits == split_id) & (chunk_labels == label))
+            first_rank = int(seen[label])
+            last_rank = first_rank + int(local.size)
+            ranks = desired_ranks[label]
+            left = int(np.searchsorted(ranks, first_rank, side="left"))
+            right = int(np.searchsorted(ranks, last_rank, side="left"))
+            take = ranks[left:right] - first_rank
+            destination = int(written[label])
+            selected_by_label[label][destination : destination + take.size] = local[take] + start
+            written[label] += take.size
+            seen[label] = last_rank
+    if any(int(written[label]) != int(targets[label]) for label in (0, 1)):
+        raise GraphVisualizationError("patient sampler did not fill its allocated output")
+    return np.sort(np.concatenate(selected_by_label))
+
+
+def _selected_edge_chunks(
+    edge_patients: np.ndarray,
+    edge_drugs: np.ndarray,
+    selected: np.ndarray,
+    *,
+    manifest: dict[str, Any],
+    split: str,
+    description: str,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    offsets = manifest.get("edge_order", {}).get("split_offsets", {}).get(split)
+    start, stop = (
+        (int(offsets[0]), int(offsets[1])) if offsets else (0, int(edge_patients.shape[0]))
+    )
+    with tqdm(
+        total=stop - start,
+        desc=description,
+        unit="edges",
+        unit_scale=True,
+        dynamic_ncols=True,
+    ) as progress:
+        for begin in range(start, stop, EDGE_SCAN_CHUNK_SIZE):
+            end = min(begin + EDGE_SCAN_CHUNK_SIZE, stop)
+            patients = np.asarray(edge_patients[begin:end], dtype=np.int64)
+            positions = np.searchsorted(selected, patients)
+            in_bounds = positions < selected.size
+            matched = np.zeros(patients.size, dtype=bool)
+            matched[in_bounds] = selected[positions[in_bounds]] == patients[in_bounds]
+            if np.any(matched):
+                yield (
+                    positions[matched].astype(np.int32, copy=False),
+                    np.asarray(edge_drugs[begin:end])[matched].astype(np.int64, copy=False),
+                )
+            progress.update(end - begin)
+
+
+def _selected_drug_frequencies(
+    edge_patients: np.ndarray,
+    edge_drugs: np.ndarray,
+    selected: np.ndarray,
+    *,
+    graph_drug_count: int,
+    manifest: dict[str, Any],
+    split: str,
+) -> np.ndarray:
+    frequencies = np.zeros(graph_drug_count, dtype=np.int64)
+    for _patient_local, drugs in _selected_edge_chunks(
+        edge_patients,
+        edge_drugs,
+        selected,
+        manifest=manifest,
+        split=split,
+        description="Exposure pass 1/2",
+    ):
+        if np.any(drugs < 0) or np.any(drugs >= graph_drug_count):
+            raise GraphVisualizationError("edge references a drug outside graph bounds")
+        frequencies += np.bincount(drugs, minlength=graph_drug_count)
+    return frequencies
+
+
+def _highest_frequency_drugs(frequencies: np.ndarray, limit: int) -> np.ndarray:
+    present = np.flatnonzero(frequencies)
+    if present.size == 0:
+        return present.astype(np.int64)
+    order = np.lexsort((present, -frequencies[present]))
+    return present[order[:limit]].astype(np.int64, copy=False)
+
+
+def _write_edge_indices(
+    path: Path,
+    edge_patients: np.ndarray,
+    edge_drugs: np.ndarray,
+    selected: np.ndarray,
+    drug_global_to_local: np.ndarray,
+    *,
+    expected_edges: int,
+    manifest: dict[str, Any],
+    split: str,
+) -> None:
+    temporary, output = _open_binary_memmap(path, (expected_edges, 2), np.dtype("<i4"))
+    cursor = 0
+    try:
+        for patient_local, drugs in _selected_edge_chunks(
+            edge_patients,
+            edge_drugs,
+            selected,
+            manifest=manifest,
+            split=split,
+            description="Exposure pass 2/2",
+        ):
+            drug_local = drug_global_to_local[drugs]
+            keep = drug_local >= 0
+            amount = int(np.count_nonzero(keep))
+            if amount:
+                output[cursor : cursor + amount, 0] = patient_local[keep]
+                output[cursor : cursor + amount, 1] = selected.size + drug_local[keep]
+                cursor += amount
+        if cursor != expected_edges:
+            raise GraphVisualizationError(
+                f"edge export count changed between passes: {cursor} != {expected_edges}"
+            )
+        output.flush()
+    finally:
+        del output
+    temporary.replace(path)
+
+
+def _write_patient_coordinates(
+    path: Path,
+    labels: np.ndarray,
+    selected: np.ndarray,
+    *,
+    seed: int,
+    layout: str,
+) -> None:
+    temporary, output = _open_binary_memmap(path, (selected.size, 3), np.dtype("<f4"))
+    golden_angle = np.pi * (3.0 - np.sqrt(5.0))
+    try:
+        for start in range(0, selected.size, PATIENT_WRITE_CHUNK_SIZE):
+            stop = min(start + PATIENT_WRITE_CHUNK_SIZE, selected.size)
+            ordinal = np.arange(start, stop, dtype=np.float64)
+            fraction = (ordinal + 0.5) / max(1, selected.size)
+            radius = 1.48 * np.sqrt(fraction)
+            angle = (ordinal + (seed % 104729)) * golden_angle
+            patient_labels = np.asarray(labels[selected[start:stop]], dtype=np.float32)
+            output[start:stop, 0] = -1.18 + (patient_labels - 0.5) * 0.12
+            output[start:stop, 1] = radius * np.cos(angle)
+            output[start:stop, 2] = radius * np.sin(angle) if layout == "3d" else 0.0
+        output.flush()
+    finally:
+        del output
+    temporary.replace(path)
+
+
+def _write_drug_coordinates(path: Path, count: int, *, layout: str) -> None:
+    temporary, output = _open_binary_memmap(path, (count, 3), np.dtype("<f4"))
+    ordinal = np.arange(count, dtype=np.float64)
+    fraction = (ordinal + 0.5) / max(1, count)
+    angle = ordinal * np.pi * (3.0 - np.sqrt(5.0))
+    radius = 1.10 * np.sqrt(fraction)
+    try:
+        output[:, 0] = 1.18
+        output[:, 1] = radius * np.cos(angle)
+        output[:, 2] = radius * np.sin(angle) if layout == "3d" else 0.0
+        output.flush()
+    finally:
+        del output
+    temporary.replace(path)
+
+
+def _write_selected_uint8(path: Path, source: np.ndarray, selected: np.ndarray) -> None:
+    temporary, output = _open_binary_memmap(path, (selected.size,), np.dtype("u1"))
+    try:
+        for start in range(0, selected.size, PATIENT_WRITE_CHUNK_SIZE):
+            stop = min(start + PATIENT_WRITE_CHUNK_SIZE, selected.size)
+            output[start:stop] = np.asarray(source[selected[start:stop]], dtype=np.uint8)
+        output.flush()
+    finally:
+        del output
+    temporary.replace(path)
+
+
+def _open_binary_memmap(
+    path: Path, shape: tuple[int, ...], dtype: np.dtype[Any]
+) -> tuple[Path, np.memmap]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary.unlink(missing_ok=True)
+        output = np.memmap(temporary, mode="w+", dtype=dtype, shape=shape)
+    except (OSError, ValueError) as exc:
+        raise GraphVisualizationError(
+            f"cannot allocate binary visualization asset: {path}"
+        ) from exc
+    return temporary, output
+
+
+def _binary_metadata(path: Path, dtype: str, shape: list[int]) -> dict[str, str | int | list[int]]:
+    return {"path": path.name, "dtype": dtype, "shape": shape, "bytes": path.stat().st_size}
+
+
+def _rendered_drug_metadata(
+    kept_drugs: np.ndarray,
+    frequencies: np.ndarray,
+    metadata: dict[int, dict[str, Any]],
+    names: dict[int, str],
+    drug_x: np.ndarray | None,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for local_index, raw_global_index in enumerate(kept_drugs):
+        global_index = int(raw_global_index)
+        source = metadata.get(global_index, {})
+        features = _describe_drug_features(drug_x, global_index)
+        result.append(
+            {
+                "index": local_index,
+                "source_index": global_index,
+                "label": names.get(global_index)
+                or str(source.get("node_label", f"Drug {global_index}")),
+                "semantic_id": int(source.get("semantic_id", 0)),
+                "kind": str(source.get("node_kind", "unknown")),
+                "degree": int(frequencies[global_index]),
+                **features,
+            }
+        )
+    return result
 
 
 def _resolve_array_manifest(data_dir: Path, graph_dir: Path | None) -> Path:
     if graph_dir is not None:
         source = Path(graph_dir).resolve()
         candidates = (
-            (source,) if source.is_file() else (
+            (source,)
+            if source.is_file()
+            else (
                 source / "tekarx_graph_arrays" / "manifest.json",
                 source / "manifest.json",
             )
@@ -251,8 +598,9 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise GraphVisualizationError(f"cannot read graph array manifest: {path}") from exc
     if manifest.get("format") != "tekarx.memmap_graph":
-        graph_format = manifest.get("format")
-        raise GraphVisualizationError(f"unsupported graph manifest format: {graph_format!r}")
+        raise GraphVisualizationError(
+            f"unsupported graph manifest format: {manifest.get('format')!r}"
+        )
     return manifest
 
 
@@ -286,77 +634,7 @@ def _load_array(
     return array
 
 
-def _sample_patient_indices(
-    split_ids: np.ndarray,
-    labels: np.ndarray,
-    *,
-    split_id: int,
-    count: int,
-    seed: int,
-) -> list[int]:
-    rng = np.random.default_rng(seed)
-    targets = {1: count // 2, 0: count - count // 2}
-    selected: dict[int, list[int]] = {0: [], 1: []}
-    seen: set[int] = set()
-    maximum_draws = min(max(int(split_ids.shape[0]) * 2, 50_000), 5_000_000)
-    draws = 0
-    while sum(len(values) for values in selected.values()) < count and draws < maximum_draws:
-        batch = rng.integers(0, split_ids.shape[0], size=min(4096, maximum_draws - draws))
-        draws += int(batch.size)
-        for raw_index in batch:
-            index = int(raw_index)
-            if index in seen or int(split_ids[index]) != split_id:
-                continue
-            label = int(labels[index])
-            if label not in (0, 1) or len(selected[label]) >= targets[label]:
-                continue
-            seen.add(index)
-            selected[label].append(index)
-            if sum(len(values) for values in selected.values()) >= count:
-                break
-    chosen = selected[0] + selected[1]
-    if len(chosen) < count:
-        for start in range(0, split_ids.shape[0], 1_000_000):
-            stop = min(start + 1_000_000, split_ids.shape[0])
-            candidates = np.flatnonzero(np.asarray(split_ids[start:stop]) == split_id) + start
-            for raw_index in candidates:
-                index = int(raw_index)
-                if index in seen:
-                    continue
-                seen.add(index)
-                chosen.append(index)
-                if len(chosen) >= count:
-                    break
-            if len(chosen) >= count:
-                break
-    if not chosen:
-        raise GraphVisualizationError("selected graph split has no patients")
-    return sorted(chosen[:count])
-
-
-def _edges_for_patients(
-    edge_patients: np.ndarray,
-    edge_drugs: np.ndarray,
-    patients: list[int],
-    *,
-    manifest: dict[str, Any],
-    split: str,
-) -> list[tuple[int, int]]:
-    offsets = manifest.get("edge_order", {}).get("split_offsets", {}).get(split)
-    start, stop = (int(offsets[0]), int(offsets[1])) if offsets else (0, edge_patients.shape[0])
-    patient_view = edge_patients[start:stop]
-    drug_view = edge_drugs[start:stop]
-    result: list[tuple[int, int]] = []
-    for patient in patients:
-        left = int(np.searchsorted(patient_view, patient, side="left"))
-        right = int(np.searchsorted(patient_view, patient, side="right"))
-        result.extend((patient, int(drug)) for drug in drug_view[left:right])
-    return result
-
-
-def _read_drug_metadata(
-    manifest_path: Path, manifest: dict[str, Any]
-) -> dict[int, dict[str, Any]]:
+def _read_drug_metadata(manifest_path: Path, manifest: dict[str, Any]) -> dict[int, dict[str, Any]]:
     relative = manifest.get("drug_metadata_path")
     if not isinstance(relative, str):
         raise GraphVisualizationError("graph manifest has no drug_metadata_path")
@@ -364,10 +642,7 @@ def _read_drug_metadata(
     if not path.is_file():
         raise GraphVisualizationError(f"missing drug metadata: {path}")
     table = pq.read_table(path, columns=["node_index", "semantic_id", "node_label", "node_kind"])
-    return {
-        int(row["node_index"]): row
-        for row in table.to_pylist()
-    }
+    return {int(row["node_index"]): row for row in table.to_pylist()}
 
 
 def _drugcentral_names(
@@ -408,151 +683,28 @@ def _describe_drug_features(drug_x: np.ndarray | None, index: int) -> dict[str, 
     }
 
 
-def _render_html(payload: dict[str, Any], *, layout: str) -> str:
+def _render_webgl_html(*, split: str, layout: str, manifest_url: str) -> str:
+    template = files("tekarx").joinpath("templates", "graph_webgl.html").read_text(encoding="utf-8")
+    title = f"TekaRx {split.title()} Patient-Drug Graph"
     if layout == "3d":
-        return _render_3d_html(payload)
-    return _render_2d_html(payload)
+        title += " - 3D"
+    return (
+        template.replace("__TEKARX_TITLE__", title)
+        .replace("__TEKARX_MANIFEST_URL__", json.dumps(manifest_url))
+        .replace("__TEKARX_LAYOUT__", json.dumps(layout))
+    )
 
 
-def _render_2d_html(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-    title = f"TekaRx {payload['split'].title()} Patient–Drug Graph"
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title)}</title>
-<style>
-:root {{ color-scheme: dark; font-family: Inter,Segoe UI,sans-serif; }}
-body {{ margin:0; background:#0b1020; color:#e5e7eb; }}
-header {{ padding:18px 24px; background:#111827; position:sticky; top:0; z-index:5; }}
-h1 {{ margin:0 0 6px; font-size:22px; }} .sub {{ color:#9ca3af; font-size:13px; }}
-.controls {{ display:flex; flex-wrap:wrap; gap:16px; margin-top:12px; align-items:center; }}
-label {{ font-size:13px; }} input[type=range] {{ vertical-align:middle; }}
-#canvas {{ overflow:auto; height:calc(100vh - 145px); }}
-svg {{ min-width:1100px; background:radial-gradient(circle at center,#172033,#0b1020 65%); }}
-.edge {{ stroke:#64748b; stroke-width:1; }}
-.patient {{ stroke:#fff; stroke-width:1.2; cursor:pointer; }}
-.drug {{ stroke:#e5e7eb; stroke-width:1.3; cursor:pointer; }}
-.boxed {{ stroke:#fbbf24; stroke-width:3; }}
-.node-label {{ fill:#d1d5db; font-size:11px; pointer-events:none; }}
-.muted {{ opacity:.06 !important; }} .highlight {{ opacity:1 !important; stroke-width:2.5; }}
-.legend {{ display:flex; gap:14px; font-size:12px; color:#cbd5e1; }}
-.dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:5px; }}
-</style></head><body>
-<header><h1>{html.escape(title)}</h1>
-<div class="sub" id="summary"></div>
-<div class="controls">
-<label><input id="show-serious" type="checkbox" checked> Serious patients</label>
-<label><input id="show-nonserious" type="checkbox" checked> Non-serious patients</label>
-<label>Edge opacity <input id="opacity" type="range" min="0.02" max="0.8" step="0.02" value="0.18"></label>
-<div class="legend"><span><i class="dot" style="background:#ef4444"></i>Serious</span>
-<span><i class="dot" style="background:#3b82f6"></i>Non-serious</span>
-<span><i class="dot" style="background:#10b981"></i>Drug</span>
-<span><i class="dot" style="background:#fbbf24"></i>Boxed-warning border</span></div>
-</div></header><main id="canvas"></main>
-<script>
-const data={encoded};
-const ns='http://www.w3.org/2000/svg';
-const height=Math.max(780,Math.max(data.patients.length,data.drugs.length)*24+80), width=1200;
-const svg=document.createElementNS(ns,'svg'); svg.setAttribute('viewBox',`0 0 ${{width}} ${{height}}`);
-svg.setAttribute('width','100%'); svg.setAttribute('height',height); document.querySelector('#canvas').append(svg);
-const serious=data.patients.filter(x=>x.serious).length;
-document.querySelector('#summary').textContent=`${{data.patients.length}} patients (${{serious}} serious), ${{data.drugs.length}} drugs, ${{data.edges.length}} exposures · Hover a node to isolate its neighborhood`;
-const pos={{}};
-const patients=[...data.patients].sort((a,b)=>b.serious-a.serious||a.primaryid.localeCompare(b.primaryid));
-patients.forEach((n,i)=>pos[n.id]=[230,55+i*(height-110)/Math.max(1,patients.length-1)]);
-data.drugs.forEach((n,i)=>pos[n.id]=[940,55+i*(height-110)/Math.max(1,data.drugs.length-1)]);
-const adjacency={{}}; [...data.patients,...data.drugs].forEach(n=>adjacency[n.id]=new Set());
-data.edges.forEach(e=>{{adjacency[e.source].add(e.target);adjacency[e.target].add(e.source);}});
-const edgeEls=[];
-data.edges.forEach((e,i)=>{{const line=document.createElementNS(ns,'line');line.classList.add('edge');line.dataset.source=e.source;line.dataset.target=e.target;line.setAttribute('x1',pos[e.source][0]);line.setAttribute('y1',pos[e.source][1]);line.setAttribute('x2',pos[e.target][0]);line.setAttribute('y2',pos[e.target][1]);line.style.opacity=.18;svg.append(line);edgeEls.push(line);}});
-const nodeEls={{}};
-function addNode(n,type){{const [x,y]=pos[n.id],g=document.createElementNS(ns,'g'),c=document.createElementNS(ns,'circle'),t=document.createElementNS(ns,'title');g.dataset.id=n.id;g.dataset.type=type;c.setAttribute('cx',x);c.setAttribute('cy',y);c.setAttribute('r',type==='patient'?7:Math.min(16,7+Math.sqrt(n.degree||1)*1.5));c.classList.add(type);if(type==='patient')c.setAttribute('fill',n.serious?'#ef4444':'#3b82f6');else{{c.setAttribute('fill','#10b981');if(n.boxed_warning)c.classList.add('boxed');}}t.textContent=type==='patient'?`Report ${{n.primaryid}}\nSerious: ${{Boolean(n.serious)}}`:`${{n.label}}\nATC: ${{n.atc}}\nDegree: ${{n.degree}}\nBoxed warning: ${{n.boxed_warning}}\nROR z-score: ${{n.ror_z??'n/a'}}`;c.append(t);g.append(c);const label=document.createElementNS(ns,'text');label.classList.add('node-label');label.setAttribute('x',type==='patient'?x-12:x+18);label.setAttribute('y',y+4);label.setAttribute('text-anchor',type==='patient'?'end':'start');label.textContent=type==='patient'?n.primaryid:n.label.slice(0,30);g.append(label);g.addEventListener('mouseenter',()=>focus(n.id));g.addEventListener('mouseleave',clearFocus);svg.append(g);nodeEls[n.id]=g;}}
-patients.forEach(n=>addNode(n,'patient'));data.drugs.forEach(n=>addNode(n,'drug'));
-function focus(id){{Object.values(nodeEls).forEach(x=>x.classList.add('muted'));edgeEls.forEach(x=>x.classList.add('muted'));nodeEls[id].classList.remove('muted');nodeEls[id].classList.add('highlight');adjacency[id].forEach(other=>{{nodeEls[other].classList.remove('muted');nodeEls[other].classList.add('highlight');}});edgeEls.forEach(e=>{{if(e.dataset.source===id||e.dataset.target===id){{e.classList.remove('muted');e.classList.add('highlight');}}}});}}
-function clearFocus(){{Object.values(nodeEls).forEach(x=>x.classList.remove('muted','highlight'));edgeEls.forEach(x=>x.classList.remove('muted','highlight'));applyFilters();}}
-function applyFilters(){{const ss=document.querySelector('#show-serious').checked,sn=document.querySelector('#show-nonserious').checked;patients.forEach(n=>{{const visible=n.serious?ss:sn;nodeEls[n.id].style.display=visible?'':'none';}});edgeEls.forEach(e=>{{const p=patients.find(n=>n.id===e.dataset.source);e.style.display=(p.serious?ss:sn)?'':'none';e.style.opacity=document.querySelector('#opacity').value;}});}}
-document.querySelectorAll('input').forEach(x=>x.addEventListener('input',applyFilters));applyFilters();
-</script></body></html>"""
+def _write_text_atomic(path: Path, value: str) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(value, encoding="utf-8")
+    temporary.replace(path)
 
 
-def _render_3d_html(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-    title = f"TekaRx {payload['split'].title()} Patient–Drug Graph · 3D"
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title)}</title>
-<style>
-:root {{ color-scheme:light; font-family:"Segoe UI Variable","Aptos","Segoe UI",Arial,sans-serif; }}
-* {{ box-sizing:border-box; }} body {{ margin:0; overflow:hidden; background:#fff; color:#17324d;
-  font-variant-numeric:tabular-nums; }}
-#scene {{ position:fixed; inset:0; width:100%; height:100%; cursor:grab; }}
-#scene.dragging {{ cursor:grabbing; }}
-.panel {{ position:fixed; z-index:4; background:rgba(255,255,255,.96); backdrop-filter:blur(10px);
-  border:1px solid #dbe5ec; box-shadow:0 10px 28px rgba(30,64,90,.12); }}
-header {{ top:16px; left:16px; right:16px; padding:14px 18px 13px 21px; border-radius:12px;
-  border-left:4px solid #16888b; }}
-h1 {{ margin:0 0 4px; color:#15344f; font-size:20px; font-weight:650; letter-spacing:-.02em; }}
-.sub {{ color:#60788b; font-size:12px; }}
-.controls {{ display:flex; flex-wrap:wrap; gap:14px; align-items:center; margin-top:10px; }}
-label,button,select {{ color:#29475f; font-size:12px; font-weight:500; }}
-button,select {{ background:#f7fafb; border:1px solid #b9cbd6; padding:5px 10px; border-radius:6px;
-  cursor:pointer; }} button:hover,select:hover {{ border-color:#16888b; background:#eef8f8; }}
-input {{ accent-color:#16888b; }}
-.legend {{ right:18px; bottom:18px; padding:10px 13px; border-radius:10px; font-size:12px;
-  color:#29475f; }}
-.legend div {{ margin:4px 0; }} .dot {{ width:10px; height:10px; border-radius:50%;
-  display:inline-block; margin-right:7px; }}
-#tooltip {{ display:none; position:fixed; z-index:6; pointer-events:none; max-width:300px;
-  padding:9px 11px; border-radius:7px; color:#17324d; background:rgba(255,255,255,.98);
-  border:1px solid #b9cbd6; box-shadow:0 8px 24px rgba(30,64,90,.18); font-size:12px;
-  line-height:1.45; white-space:pre-line; }}
-.hint {{ color:#60788b; }} input[type=range] {{ vertical-align:middle; }}
-</style></head><body>
-<canvas id="scene"></canvas>
-<header class="panel"><h1>{html.escape(title)}</h1><div class="sub" id="summary"></div>
-<div class="controls">
-<span class="hint">Drag to rotate · Wheel to zoom · Hover to isolate a neighborhood</span>
-<label><input id="show-serious" type="checkbox" checked> Serious</label>
-<label><input id="show-nonserious" type="checkbox" checked> Non-serious</label>
-<label><input id="autorotate" type="checkbox"> Auto-rotate</label>
-<label>Labels <select id="labels"><option value="top" selected>Top drugs</option>
-<option value="all">All nodes</option><option value="none">None</option></select></label>
-<label>Edges <input id="opacity" type="range" min="0.03" max="0.7" step="0.02" value="0.18"></label>
-<button id="reset">Reset view</button>
-</div></header>
-<aside class="panel legend"><div><i class="dot" style="background:#c54f55"></i>Serious patient</div>
-<div><i class="dot" style="background:#397aa8"></i>Non-serious patient</div>
-<div><i class="dot" style="background:#16888b"></i>Drug (ATC-colored)</div>
-<div><i class="dot" style="background:#d99a24"></i>Boxed-warning ring</div></aside>
-<div id="tooltip"></div>
-<script>
-const data={encoded};
-const canvas=document.querySelector('#scene'),ctx=canvas.getContext('2d'),tip=document.querySelector('#tooltip');
-const seriousCount=data.patients.filter(n=>n.serious).length;
-document.querySelector('#summary').textContent=`${{data.patients.length}} patients (${{seriousCount}} serious) · ${{data.drugs.length}} drugs · ${{data.edges.length}} exposures`;
-const palette=['#16888b','#397aa8','#d58735','#7472b2','#b85c70','#719a45','#b28a24','#368e83','#7668a8','#aa628d','#3b88ad','#c17c32','#328f72','#5f78ad','#b96872','#3c958c','#829b45','#4a88a8','#8a6dab','#ad8b32','#4b947d','#5c83ad','#a76c91','#59945d','#727daf','#b87945'];
-const nodes=[],byId=new Map(),adj=new Map();
-function cluster(source,type,cx,spread){{source.forEach((raw,i)=>{{const count=Math.max(1,source.length),u=(i+.5)/count,z=1-2*u,r=Math.sqrt(Math.max(0,1-z*z)),theta=i*2.3999632297;const node={{...raw,type,x:cx+Math.cos(theta)*r*spread*.45,y:Math.sin(theta)*r*spread,z:z*spread}};nodes.push(node);byId.set(node.id,node);adj.set(node.id,new Set());}});}}
-cluster(data.patients,'patient',-280,330);cluster(data.drugs,'drug',280,270);
-const topDrugLabels=new Set([...data.drugs].sort((a,b)=>b.degree-a.degree||a.label.localeCompare(b.label)).slice(0,15).map(n=>n.id));
-data.edges.forEach(e=>{{adj.get(e.source).add(e.target);adj.get(e.target).add(e.source);}});
-let rx=-.18,ry=.52,zoom=820,drag=false,lastX=0,lastY=0,hovered=null,projected=[];
-function resize(){{const dpr=Math.min(window.devicePixelRatio||1,2);canvas.width=innerWidth*dpr;canvas.height=innerHeight*dpr;canvas.style.width=innerWidth+'px';canvas.style.height=innerHeight+'px';ctx.setTransform(dpr,0,0,dpr,0,0);draw();}}
-function project(n){{const cy=Math.cos(ry),sy=Math.sin(ry),cx=Math.cos(rx),sx=Math.sin(rx);const x1=n.x*cy+n.z*sy,z1=-n.x*sy+n.z*cy,y2=n.y*cx-z1*sx,z2=n.y*sx+z1*cx,scale=zoom/(1050-z2);return {{node:n,x:innerWidth/2+x1*scale,y:innerHeight/2+45+y2*scale,z:z2,scale}};}}
-function visible(n){{return n.type==='drug'||(n.serious?document.querySelector('#show-serious').checked:document.querySelector('#show-nonserious').checked);}}
-function connected(id){{return !hovered||id===hovered||adj.get(hovered)?.has(id);}}
-function nodeColor(n){{if(n.type==='patient')return n.serious?'#c54f55':'#397aa8';if(n.atc&&n.atc!=='?')return palette[(n.atc.charCodeAt(0)-65)%palette.length];return '#16888b';}}
-function nodeLabel(n){{return n.type==='patient'?`Report ${{n.primaryid}}`:n.label;}}
-function shouldLabel(n){{const mode=document.querySelector('#labels').value;if(mode==='none')return false;if(hovered)return n.id===hovered||adj.get(hovered)?.has(n.id);return mode==='all'||(n.type==='drug'&&topDrugLabels.has(n.id));}}
-function draw(){{ctx.clearRect(0,0,innerWidth,innerHeight);ctx.fillStyle='#ffffff';ctx.fillRect(0,0,innerWidth,innerHeight);projected=nodes.filter(visible).map(project);const pmap=new Map(projected.map(p=>[p.node.id,p]));const edgeOpacity=Number(document.querySelector('#opacity').value);ctx.lineWidth=1;ctx.shadowColor='transparent';data.edges.forEach(e=>{{const a=pmap.get(e.source),b=pmap.get(e.target);if(!a||!b)return;const active=!hovered||e.source===hovered||e.target===hovered;ctx.globalAlpha=active?edgeOpacity:.025;ctx.strokeStyle=active?'#879eae':'#c9d4dc';ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();}});projected.sort((a,b)=>a.z-b.z).forEach(p=>{{const n=p.node,active=connected(n.id);ctx.globalAlpha=active?Math.min(1,.58+p.scale*.5):.1;const base=n.type==='patient'?6:Math.min(15,7+Math.sqrt(n.degree||1)*1.35),radius=Math.max(3,base*p.scale);ctx.save();ctx.shadowColor='rgba(27,62,85,.24)';ctx.shadowBlur=Math.max(5,9*p.scale);ctx.shadowOffsetX=1.5;ctx.shadowOffsetY=Math.max(2,4*p.scale);ctx.beginPath();ctx.arc(p.x,p.y,radius,0,Math.PI*2);ctx.fillStyle=nodeColor(n);ctx.fill();ctx.restore();ctx.beginPath();ctx.arc(p.x,p.y,radius,0,Math.PI*2);if(n.boxed_warning){{ctx.strokeStyle='#d99a24';ctx.lineWidth=Math.max(2,3*p.scale);ctx.stroke();}}else{{ctx.strokeStyle='rgba(255,255,255,.92)';ctx.lineWidth=1.2;ctx.stroke();}}p.radius=radius;}});ctx.globalAlpha=1;ctx.shadowColor='transparent';projected.filter(p=>shouldLabel(p.node)).sort((a,b)=>a.z-b.z).forEach(p=>{{const full=nodeLabel(p.node),label=full.length>28?full.slice(0,27)+'…':full,x=p.x+p.radius+5,y=p.y-3;ctx.font=`${{hovered&&connected(p.node.id)?'650':'550'}} 11px "Segoe UI Variable","Aptos","Segoe UI",Arial,sans-serif`;ctx.lineJoin='round';ctx.lineWidth=4;ctx.strokeStyle='rgba(255,255,255,.96)';ctx.strokeText(label,x,y);ctx.fillStyle=p.node.type==='drug'?'#17324d':'#3c566b';ctx.fillText(label,x,y);}});}}
-function nearest(x,y){{let best=null,dist=Infinity;for(const p of projected){{const d=Math.hypot(p.x-x,p.y-y);if(d<Math.max(11,p.radius+5)&&d<dist){{best=p;dist=d;}}}}return best;}}
-function showTip(p,event){{if(!p){{tip.style.display='none';return;}}const n=p.node;tip.textContent=n.type==='patient'?`Report ${{n.primaryid}}\nSerious: ${{Boolean(n.serious)}}\nConnected drugs: ${{adj.get(n.id).size}}`:`${{n.label}}\nATC: ${{n.atc}}\nSample degree: ${{n.degree}}\nBoxed warning: ${{n.boxed_warning}}\nROR z-score: ${{n.ror_z??'n/a'}}`;tip.style.display='block';tip.style.left=Math.min(innerWidth-310,event.clientX+14)+'px';tip.style.top=Math.min(innerHeight-130,event.clientY+14)+'px';}}
-canvas.addEventListener('pointerdown',e=>{{drag=true;lastX=e.clientX;lastY=e.clientY;canvas.classList.add('dragging');canvas.setPointerCapture(e.pointerId);}});
-canvas.addEventListener('pointermove',e=>{{if(drag){{ry+=(e.clientX-lastX)*.008;rx+=(e.clientY-lastY)*.008;lastX=e.clientX;lastY=e.clientY;hovered=null;showTip(null,e);draw();}}else{{const p=nearest(e.clientX,e.clientY),id=p?.node.id??null;if(id!==hovered){{hovered=id;draw();}}showTip(p,e);}}}});
-canvas.addEventListener('pointerup',()=>{{drag=false;canvas.classList.remove('dragging');}});canvas.addEventListener('pointerleave',()=>{{drag=false;hovered=null;canvas.classList.remove('dragging');tip.style.display='none';draw();}});
-canvas.addEventListener('wheel',e=>{{e.preventDefault();zoom=Math.max(300,Math.min(1700,zoom*Math.exp(-e.deltaY*.001)));draw();}},{{passive:false}});
-document.querySelector('#reset').addEventListener('click',()=>{{rx=-.18;ry=.52;zoom=820;draw();}});document.querySelectorAll('input,select').forEach(x=>x.addEventListener('input',draw));
-let previous=performance.now();function animate(now){{if(document.querySelector('#autorotate').checked){{ry+=(now-previous)*.00016;draw();}}previous=now;requestAnimationFrame(animate);}}window.addEventListener('resize',resize);resize();requestAnimationFrame(animate);
-</script></body></html>"""
+def _write_json_atomic(path: Path, value: Any, *, compact: bool = False) -> None:
+    serialized = (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if compact
+        else json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    )
+    _write_text_atomic(path, serialized)
