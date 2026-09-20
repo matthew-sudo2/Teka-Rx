@@ -2,10 +2,11 @@
 
 ## Purpose
 
-The Streamlit app is a local clinician-facing verification tool for the trained TekaRx
-classifiers. It loads the persisted `data/processed/models/imrad_models.joblib` bundle and
-does not retrain models. Results are research decision-support signals only, not diagnoses or
-medical advice.
+The Streamlit app is a visitor-facing medication priority check for the trained TekaRx
+IMRAD model bundle. It loads `data/processed/models/imrad_models.joblib`, uses the stored
+`feature_cols` order, then runs bundle imputer, bundle scaler, and `predict_proba`. It does
+not retrain models or fabricate unavailable inputs. Results are research decision-support
+signals only, not medical advice.
 
 ## Run locally
 
@@ -16,67 +17,55 @@ python -m pip install -r frontend/requirements.txt
 streamlit run frontend/streamlit_app.py
 ```
 
-The app expects the model bundle, `drug_dictionary.parquet`, and
-`tekarx_cohort_enriched.parquet` under `data/processed/`. The model bundle is the artifact
-written by the final save cell in `notebooks/TekaRx_IMRAD_Models.ipynb`.
+The app expects:
 
-## Pages
+- `data/processed/models/imrad_models.joblib`
+- `data/processed/drug_dictionary.parquet`
 
-### Patient Risk Triage
+If either artifact is missing, the app shows an in-page recovery panel with the repository
+commands to rebuild the processed data and save the model bundle.
 
-Enter age, sex, optional weight, and comma- or newline-separated medication names. Each name is
-matched against `drug_dictionary.parquet` with RapidFuzz, and the sidebar shows the selected raw
-name and match score. The page displays the derived drug/ATC/ROR features, model probability,
-thresholded class, and the five highest model importance/coefficient signals.
+```powershell
+python -m pip install -e .[imrad,notebook]
+tekarx build-prospective --data-dir data
+jupyter nbconvert --to notebook --execute notebooks/TekaRx_IMRAD_Models.ipynb --output TekaRx_IMRAD_Models.executed.ipynb --output-dir notebooks
+```
 
-The app aligns the input to the exact 87-column `feature_cols` list stored in the joblib bundle.
-Features unavailable from a free-text clinical form, including dosage and patient-specific graph
-statistics, are initialized from the train-fitted imputer. This prevents accidental column
-reordering or fabricated values.
+## Visitor Workflow
 
-### Model Comparison
+The dashboard is built around one task: enter age, sex, and medications, then run the TekaRx
+score. Medication names are fuzzy-matched with RapidFuzz against
+`drug_dictionary.parquet["faers_raw"]`. The result includes:
 
-The same feature row is sent through Random Forest, calibrated SVM, and AdaBoost. The page shows
-the three serious probabilities, their ensemble average, and a bar chart.
+- Model Priority Score with the frozen threshold
+- No Priority Signal or Review Priority Signal label
+- Medication Mapping Coverage for matched, ambiguous, and unmatched names
+- Contribution to Model Score, using the top five model feature importances
+- The one-line research decision-support disclaimer beside the result
 
-### Batch Verification
+The app initializes the feature row from the train-fitted imputer statistics and only replaces
+fields that can be derived from the visitor form and dictionary mapping. This keeps the saved
+feature schema authoritative and prevents accidental column reordering.
 
-Upload a CSV containing the exact model feature columns. The app computes all three probabilities
-and classes. If the CSV contains `is_serious`, it reports AUC, PR-AUC, accuracy, precision,
-recall, and F1. The **Verify against the stored test split** button reads the held-out test rows
-from the enriched cohort and recomputes a Random Forest AUC from the persisted artifacts.
-
-## Reproduce a prediction from the notebook
+## Reproduce a Prediction from Python
 
 ```python
 import joblib
 import pandas as pd
 
 artifacts = joblib.load("data/processed/models/imrad_models.joblib")
-features = pd.read_parquet("data/processed/tekarx_cohort_enriched.parquet")
-feature_cols = artifacts["feature_cols"]
-test = features.loc[features["split"] == "test"]
-X = artifacts["scaler"].transform(artifacts["imputer"].transform(test[feature_cols]))
+frame = pd.DataFrame([{column: None for column in artifacts["feature_cols"]}])
+X = artifacts["scaler"].transform(artifacts["imputer"].transform(frame))
 probability = artifacts["random_forest"].predict_proba(X)[:, 1]
 ```
 
-The app follows the same order: bundle imputer, bundle scaler, then `predict_proba`.
+The dashboard follows the same model path: bundle imputer, bundle scaler, then
+`predict_proba`.
 
-## Screenshots
+## Known Limitations
 
-Screenshots can be added here after a local run. Suggested captures are the triage page with
-match scores visible, the model comparison chart, and the batch verification metrics table.
-
-## Known limitations
-
-- The app is a verification surface, not a deployment system or clinical decision system.
-- The current repository contains no standalone `tekarx_graph_features.parquet` at the root.
-  When it is present, the app reads its graph columns; otherwise it uses the trained imputer
-  medians and displays that fallback explicitly.
-- Free-text medication matching is approximate. A high fuzzy score is not evidence of clinical
-  equivalence, and unmatched names fall back to baseline dictionary behavior.
-- Dosage, reactions, route, and other exposure features cannot be recovered reliably from the
-  small manual form, so they remain train-fitted defaults.
-- Batch CSVs must use the exact feature names and semantics from the saved bundle.
-- Model probabilities reflect the training data and calibration; they do not establish drug
-  causality or patient-specific risk.
+- Free-text medication matching is approximate. Confirm ambiguous and unmatched names.
+- Dosage, reaction, route, and patient-specific graph inputs are not collected in the form, so
+  unavailable values remain train-fitted imputer defaults.
+- Model probabilities reflect the training data and calibration. They do not establish drug
+  causality or patient-specific diagnosis.
