@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROCESSED = ROOT / "data" / "processed"
 BUNDLE_PATH = PROCESSED / "models" / "imrad_models.joblib"
 DICTIONARY_PATH = PROCESSED / "drug_dictionary.parquet"
+COHORT_PATH = PROCESSED / "tekarx_cohort.parquet"
 
 DISCLAIMER = "Research decision-support, not medical advice."
 MODEL_KEY = "random_forest"
@@ -81,6 +82,66 @@ def _validate_dictionary(dictionary: pd.DataFrame) -> None:
 
 def _parse_medications(value: str) -> list[str]:
     return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+
+
+def _generate_record(
+    bundle: dict[str, Any], dictionary: pd.DataFrame
+) -> tuple[float, str, str, list[str]]:
+    """Generate a testable record from cohort or synthesized stats.
+
+    Returns: (age, sex, meds_str, generated_field_names)
+    """
+    # Check if cohort exists for realistic sampling
+    if COHORT_PATH.is_file():
+        try:
+            cohort = pd.read_parquet(COHORT_PATH)
+            if len(cohort) > 0:
+                # Sample a random patient record
+                record = cohort.sample(n=1).iloc[0].to_dict()
+                age = float(record.get("age", np.random.randint(18, 85)))
+                sex = str(record.get("sex", "Unknown"))
+
+                # Extract medications if available; otherwise synthesize
+                meds_col = None
+                for col in cohort.columns:
+                    if "med" in col.lower() or "drug" in col.lower():
+                        meds_col = col
+                        break
+
+                if meds_col and pd.notna(record.get(meds_col)):
+                    meds_str = str(record[meds_col])
+                else:
+                    # Synthesize from dictionary
+                    sample_size = min(4, len(dictionary))
+                    frequent = (
+                        dictionary["faers_raw"]
+                        .dropna()
+                        .drop_duplicates()
+                        .sample(sample_size, random_state=None)
+                        .tolist()
+                    )
+                    meds_str = "\n".join(frequent)
+
+                return age, sex, meds_str, ["age", "sex", "medications"]
+        except Exception:
+            pass  # Fall through to synthesis
+
+    # Synthesize from frozen imputer stats + frequent drugs
+    age = float(np.random.randint(30, 80))
+    sex = np.random.choice(["Female", "Male", "Unknown"])
+
+    # Sample 3-5 frequent drugs from dictionary
+    sample_size = min(np.random.randint(3, 6), len(dictionary))
+    frequent = (
+        dictionary["faers_raw"]
+        .dropna()
+        .drop_duplicates()
+        .sample(sample_size, random_state=None)
+        .tolist()
+    )
+    meds_str = "\n".join(frequent)
+
+    return age, sex, meds_str, ["age", "sex", "medications"]
 
 
 def _match_medications(
@@ -266,7 +327,9 @@ def _top_contributors(bundle: dict[str, Any], frame: pd.DataFrame) -> pd.DataFra
     df = pd.DataFrame(records).sort_values("Relative Importance", ascending=False).head(5)
     total_top = df["Relative Importance"].sum()
     if total_top > 0:
-        df["Relative Contribution"] = df["Relative Importance"].map(lambda v: f"{v / total_top:.1%}")
+        df["Relative Contribution"] = df["Relative Importance"].map(
+            lambda v: f"{v / total_top:.1%}"
+        )
     else:
         df["Relative Contribution"] = "N/A"
     return df[["Feature", "Regimen Value", "Relative Contribution"]]
@@ -313,7 +376,13 @@ def _format_feature_value(name: str, val: Any) -> str:
     val = float(val)
     if "has_" in name or "_missing" in name or "_unknown" in name or name.startswith("age_group_"):
         return "Yes" if val >= 0.5 else "No"
-    if name in {"num_drugs", "high_ror_count", "atc_diversity", "atc_l2_diversity", "therapeutic_duplicates"}:
+    if name in {
+        "num_drugs",
+        "high_ror_count",
+        "atc_diversity",
+        "atc_l2_diversity",
+        "therapeutic_duplicates",
+    }:
         return f"{int(round(val))}"
     if name == "age_imputed_years":
         return f"{val:.0f} years"
@@ -650,6 +719,23 @@ def _render_css() -> None:
           outline-offset: 2px;
         }
 
+        /* Generated field highlight */
+        .generated-field {
+          background-color: #e8f4f8 !important;
+          border: 1px solid #b3d9e8 !important;
+        }
+
+        .generated-badge {
+          display: inline-block;
+          font-size: 0.7rem;
+          background: #b3d9e8;
+          color: #0d4a66;
+          padding: 0.15rem 0.4rem;
+          border-radius: 3px;
+          margin-left: 0.3rem;
+          font-weight: 600;
+        }
+
         /* Secondary example button styling */
         button[kind="secondary"] {
           background: var(--white) !important;
@@ -717,22 +803,48 @@ def _render_empty_state() -> None:
         unsafe_allow_html=True,
     )
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("Load High-Priority Polypharmacy Example", key="btn_high_example", use_container_width=True):
+        if st.button(
+            "Load High-Priority Polypharmacy Example",
+            key="btn_high_example",
+            use_container_width=True,
+        ):
             st.session_state["prefill_age"] = 74
             st.session_state["prefill_sex"] = "Female"
-            st.session_state["prefill_meds"] = "Warfarin\nIbuprofen\nTramadol\nMetoprolol\nOmeprazole"
+            st.session_state["prefill_meds"] = (
+                "Warfarin\nIbuprofen\nTramadol\nMetoprolol\nOmeprazole"
+            )
             st.session_state["auto_submit"] = True
+            st.session_state["generated_fields"] = []
             st.rerun()
 
     with col2:
-        if st.button("Load Maintenance Monotherapy Example", key="btn_low_example", use_container_width=True):
+        if st.button(
+            "Load Maintenance Monotherapy Example", key="btn_low_example", use_container_width=True
+        ):
             st.session_state["prefill_age"] = 52
             st.session_state["prefill_sex"] = "Male"
             st.session_state["prefill_meds"] = "Metformin\nAtorvastatin\nLevothyroxine"
             st.session_state["auto_submit"] = True
+            st.session_state["generated_fields"] = []
             st.rerun()
+
+    with col3:
+        if st.button("Generate Random Record", key="btn_generate_record", use_container_width=True):
+            try:
+                artifacts = load_artifacts()
+                age, sex, meds, generated = _generate_record(
+                    artifacts["bundle"], artifacts["dictionary"]
+                )
+                st.session_state["prefill_age"] = age
+                st.session_state["prefill_sex"] = sex
+                st.session_state["prefill_meds"] = meds
+                st.session_state["auto_submit"] = True
+                st.session_state["generated_fields"] = generated
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not generate record: {e}")
 
 
 def _render_match_feedback(match_details: list[dict[str, Any]]) -> int:
@@ -754,7 +866,9 @@ def _render_match_feedback(match_details: list[dict[str, Any]]) -> int:
     )
     display["Match Confidence"] = display["Match Confidence"].map(lambda v: f"{v:.0f}%")
     display["Mapping Status"] = display["Mapping Status"].map(
-        lambda s: "Matched" if s == "matched" else ("Ambiguous" if s == "ambiguous" else "Unmatched")
+        lambda s: (
+            "Matched" if s == "matched" else ("Ambiguous" if s == "ambiguous" else "Unmatched")
+        )
     )
     display["Included in Model Features"] = display["Included in Model Features"].map(
         lambda u: "Yes" if u else "No"
@@ -808,15 +922,15 @@ def _render_result(
         <div class="status-grid">
           <div class="status-card">
             <span>Matched Medications</span>
-            <strong>{summary['Matched medications']}</strong>
+            <strong>{summary["Matched medications"]}</strong>
           </div>
           <div class="status-card">
             <span>Highest Drug ROR</span>
-            <strong>{summary['Highest ROR']:.2f}</strong>
+            <strong>{summary["Highest ROR"]:.2f}</strong>
           </div>
           <div class="status-card">
             <span>Boxed Warning</span>
-            <strong>{summary['Boxed warning']}</strong>
+            <strong>{summary["Boxed warning"]}</strong>
           </div>
         </div>
         """,
@@ -824,7 +938,9 @@ def _render_result(
     )
 
     st.subheader("Contribution to Model Score")
-    st.caption("Top feature contributions from the frozen model pipeline for this specific patient input.")
+    st.caption(
+        "Top feature contributions from the frozen model pipeline for this specific patient input."
+    )
     st.dataframe(contributors, hide_index=True, use_container_width=True)
 
 
@@ -852,6 +968,7 @@ def main() -> None:
     prefill_age = st.session_state.get("prefill_age", 65)
     prefill_sex = st.session_state.get("prefill_sex", "Female")
     prefill_meds = st.session_state.get("prefill_meds", "")
+    generated_fields = st.session_state.get("generated_fields", [])
     sex_options = ("Female", "Male", "Unknown")
     sex_index = sex_options.index(prefill_sex) if prefill_sex in sex_options else 2
 
@@ -862,26 +979,41 @@ def main() -> None:
     with left:
         with st.form("prediction_form"):
             st.subheader("Patient Regimen Entry")
+
+            # Age field with generated indicator
+            age_label = "Patient Age (years)"
+            if "age" in generated_fields:
+                age_label += " <span class='generated-badge'>Generated</span>"
             age = st.number_input(
-                "Patient Age (years)",
+                age_label,
                 min_value=0,
                 max_value=120,
                 value=int(prefill_age),
                 step=1,
-                help="Patient chronological age in years.",
+                help="Patient chronological age in years. Generated fields are editable.",
             )
+
+            # Sex field with generated indicator
+            sex_label = "Biological Sex"
+            if "sex" in generated_fields:
+                sex_label += " <span class='generated-badge'>Generated</span>"
             sex = st.selectbox(
-                "Biological Sex",
+                sex_label,
                 sex_options,
                 index=sex_index,
-                help="Reported patient sex.",
+                help="Reported patient sex. Generated fields are editable.",
             )
+
+            # Medications field with generated indicator
+            meds_label = "Active Medications"
+            if "medications" in generated_fields:
+                meds_label += " <span class='generated-badge'>Generated</span>"
             medications = st.text_area(
-                "Active Medications",
+                meds_label,
                 value=prefill_meds,
                 height=180,
                 placeholder="Example:\nAspirin\nMetformin\nAtorvastatin\nLisinopril",
-                help="Enter one medication per line, or separate drug names with commas.",
+                help="Enter one medication per line, or separate drug names with commas. Generated fields are editable.",
             )
             submitted = st.form_submit_button("Run TekaRx score", use_container_width=True)
 
@@ -891,6 +1023,10 @@ def main() -> None:
 
     queries = _parse_medications(medications)
     trigger_run = submitted or auto_submit
+
+    # Clear generated_fields flag when user manually edits values
+    if submitted and generated_fields:
+        st.session_state["generated_fields"] = []
 
     with right:
         if not trigger_run and not queries:

@@ -14,7 +14,8 @@ streamlit run frontend/streamlit_app.py
 The dashboard has one primary workflow: enter age, sex, and medication names, then run the
 TekaRx Model Priority Score. Medication matching uses RapidFuzz against
 `drug_dictionary.parquet["faers_raw"]`, and the result shows mapping coverage, the frozen
-threshold, plain-language next steps, and the top five contributors.
+threshold, plain-language next steps, and the top five contributors. You can also generate a
+test record from train-fitted stats or a stored cohort parquet (if available).
 
 See [the dashboard guide](../docs/streamlit_dashboard.md) for the artifact contract and
 limitations.
