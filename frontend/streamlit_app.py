@@ -1,4 +1,4 @@
-"""Visitor-facing Streamlit dashboard for the frozen TekaRx IMRAD models."""
+"""Modern SaaS-grade Streamlit dashboard for frozen TekaRx IMRAD models."""
 
 from __future__ import annotations
 
@@ -16,21 +16,16 @@ ROOT = Path(__file__).resolve().parents[1]
 PROCESSED = ROOT / "data" / "processed"
 BUNDLE_PATH = PROCESSED / "models" / "imrad_models.joblib"
 DICTIONARY_PATH = PROCESSED / "drug_dictionary.parquet"
-COHORT_PATH = PROCESSED / "tekarx_cohort.parquet"
 
 DISCLAIMER = "Research decision-support, not medical advice."
 MODEL_KEY = "random_forest"
-MODEL_NAME = "Random Forest"
 DEFAULT_THRESHOLD = 0.50
 MATCHED_CUTOFF = 90.0
 AMBIGUOUS_CUTOFF = 75.0
 
 BUILD_COMMANDS = (
     "python -m pip install -e .[imrad,notebook]\n"
-    "python build_imrad_artifacts.py\n"
-    "# Expected outputs:\n"
-    "# data/processed/drug_dictionary.parquet\n"
-    "# data/processed/models/imrad_models.joblib"
+    "python build_imrad_artifacts.py"
 )
 
 
@@ -70,7 +65,9 @@ def _validate_bundle(bundle: dict[str, Any]) -> None:
     if missing:
         raise ValueError(f"Model bundle is missing keys: {', '.join(missing)}")
     if not hasattr(bundle[MODEL_KEY], "predict_proba"):
-        raise ValueError(f"Model bundle key {MODEL_KEY!r} does not expose predict_proba")
+        raise ValueError(
+            f"Model bundle key {MODEL_KEY!r} does not expose predict_proba"
+        )
 
 
 def _validate_dictionary(dictionary: pd.DataFrame) -> None:
@@ -80,79 +77,41 @@ def _validate_dictionary(dictionary: pd.DataFrame) -> None:
         raise ValueError(f"Drug dictionary is missing columns: {', '.join(missing)}")
 
 
-def _parse_medications(value: str) -> list[str]:
-    return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+def _get_drug_suggestions(
+    query: str, dictionary: pd.DataFrame, limit: int = 10
+) -> list[str]:
+    """Get top drug suggestions using RapidFuzz typeahead."""
+    if not query or len(query) < 1:
+        return []
 
-
-def _generate_record(
-    bundle: dict[str, Any], dictionary: pd.DataFrame
-) -> tuple[float, str, str, list[str]]:
-    """Generate a testable record from cohort or synthesized stats.
-
-    Returns: (age, sex, meds_str, generated_field_names)
-    """
-    # Check if cohort exists for realistic sampling
-    if COHORT_PATH.is_file():
-        try:
-            cohort = pd.read_parquet(COHORT_PATH)
-            if len(cohort) > 0:
-                # Sample a random patient record
-                record = cohort.sample(n=1).iloc[0].to_dict()
-                age = float(record.get("age", np.random.randint(18, 85)))
-                sex = str(record.get("sex", "Unknown"))
-
-                # Extract medications if available; otherwise synthesize
-                meds_col = None
-                for col in cohort.columns:
-                    if "med" in col.lower() or "drug" in col.lower():
-                        meds_col = col
-                        break
-
-                if meds_col and pd.notna(record.get(meds_col)):
-                    meds_str = str(record[meds_col])
-                else:
-                    # Synthesize from dictionary
-                    sample_size = min(4, len(dictionary))
-                    frequent = (
-                        dictionary["faers_raw"]
-                        .dropna()
-                        .drop_duplicates()
-                        .sample(sample_size, random_state=None)
-                        .tolist()
-                    )
-                    meds_str = "\n".join(frequent)
-
-                return age, sex, meds_str, ["age", "sex", "medications"]
-        except Exception:
-            pass  # Fall through to synthesis
-
-    # Synthesize from frozen imputer stats + frequent drugs
-    age = float(np.random.randint(30, 80))
-    sex = np.random.choice(["Female", "Male", "Unknown"])
-
-    # Sample 3-5 frequent drugs from dictionary
-    sample_size = min(np.random.randint(3, 6), len(dictionary))
-    frequent = (
-        dictionary["faers_raw"]
-        .dropna()
-        .drop_duplicates()
-        .sample(sample_size, random_state=None)
-        .tolist()
+    choices = (
+        dictionary["faers_raw"].dropna().drop_duplicates().astype(str).tolist()
     )
-    meds_str = "\n".join(frequent)
+    query_upper = query.strip().upper()
 
-    return age, sex, meds_str, ["age", "sex", "medications"]
+    # Use partial_ratio for prefix matching and autocomplete
+    candidates = process.extract(
+        query_upper, choices, scorer=fuzz.partial_ratio, limit=limit
+    )
+    # Filter by score >= 70 for quality suggestions
+    return [candidate[0] for candidate in candidates if candidate[1] >= 70]
 
 
 def _match_medications(
     queries: list[str], dictionary: pd.DataFrame
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    choices = dictionary["faers_raw"].dropna().drop_duplicates().astype(str).tolist()
+    """Match medication queries against dictionary."""
+    choices = (
+        dictionary["faers_raw"].dropna().drop_duplicates().astype(str).tolist()
+    )
     rows: list[dict[str, Any]] = []
     matches: list[dict[str, Any]] = []
 
     for query in queries:
-        candidates = process.extract(query, choices, scorer=fuzz.WRatio, limit=3)
+        query_normalized = query.strip().upper()
+        candidates = process.extract(
+            query_normalized, choices, scorer=fuzz.WRatio, limit=3
+        )
         if not candidates:
             matches.append(
                 {
@@ -160,7 +119,7 @@ def _match_medications(
                     "status": "unmatched",
                     "match": "",
                     "score": 0.0,
-                    "suggestions": "No close match found",
+                    "suggestions": "No match found",
                     "used": False,
                 }
             )
@@ -169,9 +128,11 @@ def _match_medications(
         match, score, _ = candidates[0]
         status = _match_status(float(score))
         used = status == "matched"
-        suggestions = ", ".join(str(candidate[0]) for candidate in candidates[:3])
+        suggestions = ", ".join(str(c[0]) for c in candidates[:3])
         if used:
-            rows.extend(dictionary.loc[dictionary["faers_raw"] == match].to_dict("records"))
+            rows.extend(dictionary.loc[dictionary["faers_raw"] == match].to_dict(
+                "records"
+            ))
         matches.append(
             {
                 "input": query,
@@ -205,6 +166,7 @@ def _build_features(
     matched: pd.DataFrame,
     bundle: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Build feature frame from matched drugs and demographics."""
     columns = bundle["feature_cols"]
     values = _feature_defaults(bundle)
     age = float(age)
@@ -225,14 +187,22 @@ def _build_features(
         atc_codes: list[str] = []
         boxed = 0.0
     else:
-        rors = pd.to_numeric(matched["ror"], errors="coerce").fillna(1.0).to_numpy()
+        rors = (
+            pd.to_numeric(matched["ror"], errors="coerce")
+            .fillna(1.0)
+            .to_numpy()
+        )
         atc_codes = [
             code.strip().upper()
             for raw in matched["atc_code"].dropna().astype(str)
             for code in raw.split("|")
             if len(code.strip()) >= 3 and code.strip()[0].isalpha()
         ]
-        boxed = float(pd.to_numeric(matched["has_boxed_warning"], errors="coerce").fillna(0).max())
+        boxed = float(
+            pd.to_numeric(
+                matched["has_boxed_warning"], errors="coerce"
+            ).fillna(0).max()
+        )
 
     unique_atc = sorted(set(atc_codes))
     l1 = [code[0] for code in unique_atc]
@@ -256,7 +226,8 @@ def _build_features(
             "num_drugs_squared": float(num_drugs**2),
             "num_high_risk_atc": float(len(set(high_risk))),
             "num_high_risk_atc_groups": float(
-                sum(code[:4] in {"N02A", "B01A", "M01A", "A10A"} for code in unique_atc)
+                sum(code[:4] in {"N02A", "B01A", "M01A", "A10A"}
+                    for code in unique_atc)
             ),
             "polypharmacy_age": float(num_drugs * age),
             "therapeutic_duplicates": float(max(len(l1) - len(set(l1)), 0)),
@@ -269,7 +240,8 @@ def _build_features(
             values[key] = float(l1.count(letter.upper()))
 
     frame = pd.DataFrame(
-        [{column: values.get(column, np.nan) for column in columns}], columns=columns
+        [{column: values.get(column, np.nan) for column in columns}],
+        columns=columns,
     )
     summary = {
         "Matched medications": num_drugs,
@@ -277,13 +249,14 @@ def _build_features(
         "Average ROR": float(np.exp(values["mean_log_ror"])),
         "High-ROR count": int(values["high_ror_count"]),
         "ATC diversity": int(values["atc_diversity"]),
-        "High-priority ATC groups": int(values["num_high_risk_atc"]),
-        "Boxed warning": "Present" if boxed > 0 else "None",
+        "High-priority ATC": int(values["num_high_risk_atc"]),
+        "Boxed warning": "Yes" if boxed > 0 else "No",
     }
     return frame, summary
 
 
 def _predict(frame: pd.DataFrame, artifacts: dict[str, Any]) -> float:
+    """Run prediction."""
     bundle = artifacts["bundle"]
     aligned = frame.reindex(columns=bundle["feature_cols"])
     transformed = bundle["scaler"].transform(bundle["imputer"].transform(aligned))
@@ -297,7 +270,7 @@ def _threshold(bundle: dict[str, Any]) -> float:
             return float(value)
     thresholds = bundle.get("thresholds")
     if isinstance(thresholds, dict):
-        for key in (MODEL_KEY, MODEL_NAME, "default"):
+        for key in (MODEL_KEY, "default"):
             value = thresholds.get(key)
             if isinstance(value, int | float):
                 return float(value)
@@ -305,6 +278,7 @@ def _threshold(bundle: dict[str, Any]) -> float:
 
 
 def _top_contributors(bundle: dict[str, Any], frame: pd.DataFrame) -> pd.DataFrame:
+    """Get top 5 contributing features."""
     model = bundle[MODEL_KEY]
     feature_cols = bundle["feature_cols"]
     if hasattr(model, "feature_importances_"):
@@ -319,254 +293,228 @@ def _top_contributors(bundle: dict[str, Any], frame: pd.DataFrame) -> pd.DataFra
         records.append(
             {
                 "Feature": _feature_label(col),
-                "Regimen Value": _format_feature_value(col, val),
-                "Relative Importance": float(imp),
+                "Value": _format_feature_value(col, val),
+                "Importance": float(imp),
             }
         )
 
-    df = pd.DataFrame(records).sort_values("Relative Importance", ascending=False).head(5)
-    total_top = df["Relative Importance"].sum()
-    if total_top > 0:
-        df["Relative Contribution"] = df["Relative Importance"].map(
-            lambda v: f"{v / total_top:.1%}"
+    df = (
+        pd.DataFrame(records)
+        .sort_values("Importance", ascending=False)
+        .head(5)
+    )
+    total_imp = df["Importance"].sum()
+    if total_imp > 0:
+        df["Contribution"] = df["Importance"].map(
+            lambda v: f"{v / total_imp:.1%}"
         )
     else:
-        df["Relative Contribution"] = "N/A"
-    return df[["Feature", "Regimen Value", "Relative Contribution"]]
+        df["Contribution"] = "N/A"
+    return df[["Feature", "Value", "Contribution"]]
 
 
 def _feature_label(name: str) -> str:
+    """Get human-readable feature name."""
     labels = {
         "max_ror": "Highest Drug ROR",
         "mean_log_ror": "Average Log ROR",
-        "high_ror_count": "High-ROR Medication Count",
-        "has_boxed_warning": "Boxed Warning Present",
-        "num_drugs": "Matched Medication Count",
-        "num_drugs_squared": "Medication Count (Squared)",
-        "polypharmacy_age": "Polypharmacy × Age Interaction",
-        "atc_diversity": "ATC Category Diversity",
-        "atc_l2_diversity": "ATC Level-2 Diversity",
-        "atc_l3_diversity": "ATC Level-3 Diversity",
-        "num_high_risk_atc": "High-Risk ATC Count (CNS/Cardio/Blood)",
-        "num_high_risk_atc_groups": "High-Risk ATC Subgroups",
-        "therapeutic_duplicates": "Therapeutic Duplicates (Level 1)",
+        "high_ror_count": "High-ROR Count",
+        "has_boxed_warning": "Boxed Warning",
+        "num_drugs": "Drug Count",
+        "num_drugs_squared": "Drug Count²",
+        "polypharmacy_age": "Polypharmacy × Age",
+        "atc_diversity": "ATC Diversity",
+        "atc_l2_diversity": "ATC L2 Diversity",
+        "num_high_risk_atc": "High-Risk ATC",
+        "num_high_risk_atc_groups": "High-Risk Groups",
+        "therapeutic_duplicates": "Therapeutic Duplicates",
         "age_imputed_years": "Patient Age",
-        "age_group_65_plus": "Age 65 or Older",
-        "age_group_41_64": "Age 41 to 64",
-        "age_group_18_40": "Age 18 to 40",
+        "age_group_65_plus": "Age ≥65",
         "sex_unknown": "Sex Unspecified",
-        "patient_avg_cluster_risk": "Graph Cluster Relational Risk (Avg)",
-        "patient_max_cluster_risk": "Graph Cluster Relational Risk (Max)",
-        "patient_avg_propagated_risk": "Label Propagated Relational Risk (Avg)",
-        "patient_max_propagated_risk": "Label Propagated Relational Risk (Max)",
-        "patient_avg_neighbor_ror": "Relational Neighbor ROR (Avg)",
-        "patient_max_neighbor_ror": "Relational Neighbor ROR (Max)",
-        "patient_avg_drug_degree": "Graph Drug Co-exposure Degree (Avg)",
-        "patient_max_drug_degree": "Graph Drug Co-exposure Degree (Max)",
     }
     if name.startswith("atc_l1_count_"):
         letter = name.split("_")[-1].upper()
-        return f"ATC Class {letter} Medication Count"
+        return f"ATC Class {letter}"
     return labels.get(name, name.replace("_", " ").title())
 
 
 def _format_feature_value(name: str, val: Any) -> str:
+    """Format feature value for display."""
     if val is None or pd.isna(val):
-        return "Not documented"
+        return "N/A"
     val = float(val)
-    if "has_" in name or "_missing" in name or "_unknown" in name or name.startswith("age_group_"):
+    if "has_" in name or "_missing" in name or name.startswith("age_group_"):
         return "Yes" if val >= 0.5 else "No"
     if name in {
         "num_drugs",
         "high_ror_count",
         "atc_diversity",
         "atc_l2_diversity",
-        "therapeutic_duplicates",
     }:
         return f"{int(round(val))}"
     if name == "age_imputed_years":
-        return f"{val:.0f} years"
-    if name == "polypharmacy_age":
-        return f"{val:.1f}"
+        return f"{val:.0f} yr"
     if "ror" in name:
         return f"{val:.2f}"
     return f"{val:.2f}"
 
 
-def _priority_label(probability: float, threshold: float) -> str:
-    return "Review Priority Signal" if probability >= threshold else "No Priority Signal"
-
-
-def _result_guidance(probability: float, threshold: float, unmatched_count: int) -> tuple[str, str]:
-    if probability >= threshold:
-        meaning = (
-            "The model priority score is at or above the frozen operating threshold (50%). "
-            "Based on the patient demographics and pharmacological features of the reported regimen, "
-            "this combination exhibits a priority signal consistent with serious adverse event patterns."
-        )
-        next_steps = (
-            "Conduct a clinical review of the medication list, paying particular attention to drug interactions, "
-            "cumulative organ toxicities, and the top contributing factors surfaced below."
-        )
-    else:
-        meaning = (
-            "The model priority score is below the frozen operating threshold (50%). "
-            "The combination presents No Priority Signal under the trained IMRAD seriousness model."
-        )
-        next_steps = (
-            "Document the current regimen and continue standard monitoring. Re-evaluate if medications are "
-            "added, doses adjusted, or if new symptoms arise."
-        )
-
-    if unmatched_count > 0:
-        noun = "medication was" if unmatched_count == 1 else "medications were"
-        next_steps = (
-            f"{next_steps} Note: {unmatched_count} {noun} not matched in the clinical dictionary. "
-            "Verify spellings using the suggestions below to ensure complete model coverage."
-        )
-    return meaning, next_steps
-
-
-def _show_missing_artifacts(status: ArtifactStatus, error: Exception | None = None) -> None:
-    missing_list = "\n".join(f"- {path.relative_to(ROOT)}" for path in status.missing)
-    st.markdown(
-        f"""
-        <section class="artifact-panel" role="alert">
-          <h2>Model artifacts are not ready yet</h2>
-          <p>This clinical dashboard runs strictly with the trained TekaRx model bundle and reference dictionary.
-          Models are never retrained inside the interface.</p>
-          <p class="disclaimer"><strong>Disclaimer:</strong> {DISCLAIMER}</p>
-          <p><strong>Missing artifact files:</strong></p>
-          <pre>{missing_list or "Artifact validation failed"}</pre>
-          <p><strong>Build them from the repository root:</strong></p>
-          <pre>{BUILD_COMMANDS}</pre>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-    if error is not None and not status.missing:
-        st.caption(f"Validation detail: {error}")
-
-
 def _render_css() -> None:
+    """Render modern SaaS design CSS."""
     st.markdown(
         """
         <style>
         :root {
           --ink: #16221c;
-          --ink-secondary: #485750;
-          --border: #d8e2dc;
-          --panel-bg: #f8faf9;
-          --panel-border: #e3ece6;
+          --ink-light: #485750;
+          --border: #e3ece6;
+          --bg-panel: #f9faf8;
           --green-primary: #1e5b3a;
-          --green-soft: #eaf3ed;
+          --green-light: #eaf3ed;
           --green-border: #c3ddcc;
           --amber-primary: #8a580a;
-          --amber-soft: #fef6e7;
-          --amber-border: #f2dcab;
+          --amber-light: #fef6e7;
           --red-primary: #9b2828;
-          --red-soft: #fbeeed;
+          --red-light: #fbeeed;
           --white: #ffffff;
         }
 
-        /* App base */
+        * { box-sizing: border-box; }
+
         .stApp {
-          background-color: var(--white);
+          background: var(--white);
           color: var(--ink);
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+            sans-serif;
         }
 
         .block-container {
-          max-width: 1140px;
-          padding-top: 2rem;
-          padding-bottom: 3.5rem;
+          max-width: 1280px;
+          padding: 2rem;
         }
 
-        /* Typography */
-        h1 {
-          color: var(--ink);
-          font-size: clamp(1.8rem, 3.5vw, 2.6rem);
-          font-weight: 700;
-          line-height: 1.15;
-          margin-bottom: 0.35rem;
-          letter-spacing: -0.02em;
-        }
-
-        h2 {
-          color: var(--ink);
-          font-size: 1.25rem;
-          font-weight: 650;
-          margin-top: 0.2rem;
-          margin-bottom: 0.6rem;
-          letter-spacing: -0.01em;
-        }
-
-        h3 {
-          color: var(--ink);
-          font-size: 1.05rem;
-          font-weight: 600;
-          margin-bottom: 0.4rem;
-        }
-
-        p, label, .stMarkdown, .stCaption {
-          color: var(--ink);
-        }
-
-        /* Header hero */
-        .hero {
+        /* Header */
+        .app-header {
+          margin-bottom: 2.5rem;
           border-bottom: 1px solid var(--border);
-          margin-bottom: 1.6rem;
-          padding-bottom: 1.1rem;
+          padding-bottom: 1.5rem;
         }
 
-        .hero p {
-          color: var(--ink-secondary);
-          font-size: 1.05rem;
-          line-height: 1.5;
-          max-width: 780px;
-          margin-top: 0.3rem;
+        .app-header h1 {
+          font-size: clamp(1.8rem, 4vw, 2.4rem);
+          font-weight: 700;
+          margin: 0 0 0.25rem;
+          letter-spacing: -0.02em;
+          color: var(--ink);
         }
 
-        /* Form container */
-        div[data-testid="stForm"] {
+        .app-header p {
+          font-size: 0.95rem;
+          color: var(--ink-light);
+          margin: 0;
+          line-height: 1.4;
+        }
+
+        /* Tabs styling */
+        .stTabs [data-baseweb="tab-list"] {
+          border-bottom: 1px solid var(--border);
+          gap: 0.5rem;
+        }
+
+        .stTabs [aria-selected="true"] {
+          border-bottom: 3px solid var(--green-primary) !important;
+          color: var(--green-primary) !important;
+        }
+
+        .stTabs [aria-selected="false"] {
+          color: var(--ink-light);
+        }
+
+        /* Cards */
+        .card {
           border: 1px solid var(--border);
           border-radius: 8px;
-          padding: 1.3rem;
+          padding: 1.5rem;
           background: var(--white);
-          box-shadow: 0 1px 3px rgba(22, 34, 28, 0.04);
+          box-shadow: 0 1px 3px rgba(22, 34, 28, 0.08);
         }
 
-        /* Result container */
-        .result-panel {
-          border: 1px solid var(--panel-border);
-          border-radius: 8px;
-          padding: 1.35rem;
-          background: var(--panel-bg);
-          margin-bottom: 1rem;
+        .card-sm {
+          padding: 1rem;
         }
 
-        .result-panel h2 {
-          font-size: 1.05rem;
+        .card h3 {
+          font-size: 0.9rem;
           text-transform: uppercase;
-          letter-spacing: 0.05em;
-          color: var(--ink-secondary);
-          margin-bottom: 0.2rem;
+          letter-spacing: 0.04em;
+          color: var(--ink-light);
+          margin: 0 0 0.5rem;
+          font-weight: 600;
         }
 
-        .score-row {
+        /* Input styling */
+        .drug-input-container {
+          margin-bottom: 1.5rem;
+        }
+
+        .drug-input-label {
+          display: block;
+          font-size: 0.85rem;
+          font-weight: 600;
+          color: var(--ink);
+          margin-bottom: 0.5rem;
+          text-transform: uppercase;
+          letter-spacing: 0.03em;
+        }
+
+        .drug-chips {
           display: flex;
-          align-items: baseline;
-          gap: 1rem;
-          margin: 0.4rem 0 0.8rem;
           flex-wrap: wrap;
+          gap: 0.5rem;
+          margin-bottom: 0.75rem;
+          min-height: 1.5rem;
+        }
+
+        .chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 0.5rem;
+          background: var(--green-light);
+          color: var(--green-primary);
+          border: 1px solid var(--green-border);
+          border-radius: 6px;
+          padding: 0.35rem 0.75rem;
+          font-size: 0.85rem;
+          font-weight: 500;
+        }
+
+        .chip-remove {
+          cursor: pointer;
+          font-weight: bold;
+          opacity: 0.7;
+          transition: opacity 0.2s;
+        }
+
+        .chip-remove:hover {
+          opacity: 1;
+        }
+
+        /* Score display */
+        .score-section {
+          background: var(--bg-panel);
+          border: 1px solid var(--border);
+          border-radius: 12px;
+          padding: 2rem;
+          text-align: center;
+          margin-bottom: 2rem;
         }
 
         .score-value {
-          font-size: clamp(2.8rem, 6vw, 4.4rem);
-          line-height: 1;
+          font-size: clamp(3rem, 8vw, 5rem);
           font-weight: 750;
           color: var(--green-primary);
-          letter-spacing: -0.03em;
+          line-height: 1;
+          margin: 0;
         }
 
         .score-value.high {
@@ -574,201 +522,164 @@ def _render_css() -> None:
         }
 
         .priority-badge {
-          display: inline-flex;
-          align-items: center;
-          border-radius: 6px;
-          padding: 0.4rem 0.75rem;
-          font-size: 0.95rem;
-          font-weight: 650;
-          background: var(--green-soft);
+          display: inline-block;
+          margin-top: 0.75rem;
+          padding: 0.4rem 1rem;
+          background: var(--green-light);
           color: var(--green-primary);
           border: 1px solid var(--green-border);
+          border-radius: 6px;
+          font-size: 0.9rem;
+          font-weight: 600;
         }
 
         .priority-badge.high {
-          background: var(--amber-soft);
+          background: var(--amber-light);
           color: var(--amber-primary);
-          border: 1px solid var(--amber-border);
+          border-color: #f2dcab;
         }
 
-        .threshold-caption {
-          color: var(--ink-secondary);
-          font-size: 0.92rem;
-          margin-bottom: 0.75rem;
-        }
-
-        .guidance-block {
+        .threshold-note {
+          font-size: 0.85rem;
+          color: var(--ink-light);
           margin-top: 0.75rem;
-          padding-top: 0.75rem;
-          border-top: 1px solid var(--panel-border);
-          font-size: 0.95rem;
+        }
+
+        /* Guidance cards */
+        .guidance-card {
+          border-left: 4px solid var(--green-primary);
+          background: var(--green-light);
+          padding: 1rem;
+          border-radius: 4px;
+          margin-bottom: 1rem;
+        }
+
+        .guidance-card h4 {
+          margin: 0 0 0.5rem;
+          font-size: 0.9rem;
+          color: var(--green-primary);
+          font-weight: 600;
+        }
+
+        .guidance-card p {
+          margin: 0;
+          font-size: 0.9rem;
+          color: var(--ink);
           line-height: 1.5;
         }
 
-        .guidance-block strong {
-          color: var(--ink);
+        /* Tables */
+        .stDataFrame {
+          font-size: 0.85rem !important;
         }
 
-        /* Summary status metrics */
+        /* Status grid */
         .status-grid {
           display: grid;
-          gap: 0.75rem;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
-          margin: 0.9rem 0 1.2rem;
+          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          gap: 1rem;
+          margin: 1.5rem 0;
         }
 
-        .status-card {
+        .status-item {
           border: 1px solid var(--border);
-          border-radius: 7px;
-          padding: 0.75rem 0.85rem;
-          background: var(--panel-bg);
+          border-radius: 6px;
+          padding: 1rem;
+          background: var(--bg-panel);
         }
 
-        .status-card span {
-          display: block;
-          font-size: 0.82rem;
-          color: var(--ink-secondary);
+        .status-label {
+          font-size: 0.75rem;
+          color: var(--ink-light);
           text-transform: uppercase;
           letter-spacing: 0.03em;
-          margin-bottom: 0.2rem;
-        }
-
-        .status-card strong {
-          display: block;
-          font-size: 1.25rem;
-          color: var(--ink);
-          font-weight: 650;
-        }
-
-        /* Empty state prompt */
-        .empty-panel {
-          border: 1px dashed var(--border);
-          border-radius: 8px;
-          padding: 1.8rem 1.4rem;
-          background: var(--panel-bg);
-          text-align: center;
-        }
-
-        .empty-panel h3 {
-          font-size: 1.15rem;
-          color: var(--ink);
           margin-bottom: 0.4rem;
+          font-weight: 600;
         }
 
-        .empty-panel p {
-          color: var(--ink-secondary);
-          font-size: 0.95rem;
-          max-width: 480px;
-          margin: 0 auto 1.2rem;
+        .status-value {
+          font-size: 1.25rem;
+          font-weight: 700;
+          color: var(--ink);
         }
 
-        /* Disclaimers */
-        .disclaimer {
-          color: var(--ink-secondary);
-          border-left: 3px solid var(--green-primary);
-          padding-left: 0.65rem;
-          font-size: 0.88rem;
-          line-height: 1.4;
-          margin-top: 0.85rem;
-        }
-
-        /* Artifact error panel */
-        .artifact-panel {
-          border: 1px solid var(--amber-border);
-          border-radius: 8px;
-          padding: 1.3rem;
-          background: var(--amber-soft);
-          margin-bottom: 1.5rem;
-        }
-
-        .artifact-panel h2 {
-          color: var(--amber-primary);
-          margin-top: 0;
-        }
-
-        .artifact-panel pre {
-          white-space: pre-wrap;
-          background: var(--white);
-          border: 1px solid var(--amber-border);
-          border-radius: 6px;
-          padding: 0.8rem;
-          overflow-x: auto;
-          font-size: 0.88rem;
-        }
-
-        /* Button styles */
+        /* Buttons */
         .stButton > button {
           border-radius: 6px;
           border: 1px solid var(--green-primary);
           background: var(--green-primary);
           color: var(--white);
           font-weight: 600;
-          font-size: 0.98rem;
-          min-height: 2.85rem;
-          transition: background 0.15s ease-in-out;
+          font-size: 0.95rem;
+          padding: 0.75rem 1.5rem !important;
+          transition: all 0.2s;
         }
 
         .stButton > button:hover {
-          background: #184a2f;
-          border-color: #184a2f;
-          color: var(--white);
+          background: #164a2f;
+          border-color: #164a2f;
         }
 
-        .stButton > button:focus {
-          outline: 3px solid #b7dbca;
-          outline-offset: 2px;
+        /* Disclaimer */
+        .disclaimer {
+          border-left: 3px solid var(--ink-light);
+          padding-left: 1rem;
+          font-size: 0.8rem;
+          color: var(--ink-light);
+          margin-top: 1rem;
         }
 
-        /* Generated field highlight */
-        .generated-field {
-          background-color: #e8f4f8 !important;
-          border: 1px solid #b3d9e8 !important;
+        /* Empty state */
+        .empty-state {
+          text-align: center;
+          padding: 3rem 2rem;
+          border: 2px dashed var(--border);
+          border-radius: 8px;
+          background: var(--bg-panel);
         }
 
-        .generated-badge {
-          display: inline-block;
-          font-size: 0.7rem;
-          background: #b3d9e8;
-          color: #0d4a66;
-          padding: 0.15rem 0.4rem;
-          border-radius: 3px;
-          margin-left: 0.3rem;
-          font-weight: 600;
+        .empty-state h3 {
+          font-size: 1.2rem;
+          color: var(--ink);
+          margin: 0 0 0.5rem;
         }
 
-        /* Secondary example button styling */
-        button[kind="secondary"] {
-          background: var(--white) !important;
-          color: var(--green-primary) !important;
-          border: 1px solid var(--border) !important;
-          min-height: 2.2rem !important;
-          font-size: 0.88rem !important;
+        .empty-state p {
+          color: var(--ink-light);
+          font-size: 0.9rem;
+          margin: 0;
+          line-height: 1.5;
         }
 
-        button[kind="secondary"]:hover {
-          background: var(--green-soft) !important;
-          border-color: var(--green-primary) !important;
-        }
-
-        /* Dataframe tables */
-        div[data-testid="stDataFrame"] {
-          border: 1px solid var(--border);
-          border-radius: 7px;
-          overflow: hidden;
-          margin-top: 0.4rem;
-        }
-
-        /* Responsive layout */
+        /* Mobile responsive */
         @media (max-width: 768px) {
           .block-container {
-            padding-left: 1rem;
-            padding-right: 1rem;
+            padding: 1rem;
           }
+
+          .app-header {
+            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+          }
+
+          .app-header h1 {
+            font-size: 1.5rem;
+          }
+
+          .score-section {
+            padding: 1.5rem;
+          }
+
+          .score-value {
+            font-size: 2.4rem;
+          }
+
           .status-grid {
             grid-template-columns: 1fr;
           }
-          .score-row {
-            gap: 0.5rem;
+
+          .card {
+            padding: 1rem;
           }
         }
         </style>
@@ -778,279 +689,380 @@ def _render_css() -> None:
 
 
 def _render_header() -> None:
+    """Render page header."""
     st.markdown(
         """
-        <header class="hero">
+        <div class="app-header">
           <h1>TekaRx Medication Priority Check</h1>
-          <p>Clinical decision-support tool evaluating medication regimens against the frozen TekaRx
-          IMRAD seriousness classification models. Enter patient age, sex, and medications to inspect the
-          Model Priority Score, medication mapping coverage, and top predictive contributors.</p>
-        </header>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _render_empty_state() -> None:
-    st.markdown(
-        """
-        <div class="empty-panel">
-          <h3>No Regimen Evaluated Yet</h3>
-          <p>Enter patient details and medications in the form on the left, or load one of the clinical
-          test regimens below to inspect the model output.</p>
+          <p>Enter patient age, sex, and medications to evaluate the Model Priority
+          Score against the frozen IMRAD seriousness model.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    col1, col2, col3 = st.columns(3)
+
+def _drug_autocomplete(dictionary: pd.DataFrame) -> str:
+    """Render drug autocomplete input. Returns selected drug name."""
+    st.markdown(
+        '<div class="drug-input-label">Search & Add Medications</div>',
+        unsafe_allow_html=True,
+    )
+
+    col1, col2 = st.columns([3, 1], gap="small")
     with col1:
-        if st.button(
-            "Load High-Priority Polypharmacy Example",
-            key="btn_high_example",
-            use_container_width=True,
-        ):
-            st.session_state["prefill_age"] = 74
-            st.session_state["prefill_sex"] = "Female"
-            st.session_state["prefill_meds"] = (
-                "Warfarin\nIbuprofen\nTramadol\nMetoprolol\nOmeprazole"
-            )
-            st.session_state["auto_submit"] = True
-            st.session_state["generated_fields"] = []
-            st.rerun()
+        search_term = st.text_input(
+            "Type drug name",
+            key="drug_search",
+            placeholder="e.g., Warfarin, Aspirin...",
+            label_visibility="collapsed",
+        )
+
+    if not search_term:
+        return ""
+
+    suggestions = _get_drug_suggestions(search_term, dictionary)
+    if not suggestions:
+        st.caption("No matches found")
+        return ""
 
     with col2:
-        if st.button(
-            "Load Maintenance Monotherapy Example", key="btn_low_example", use_container_width=True
-        ):
-            st.session_state["prefill_age"] = 52
-            st.session_state["prefill_sex"] = "Male"
-            st.session_state["prefill_meds"] = "Metformin\nAtorvastatin\nLevothyroxine"
-            st.session_state["auto_submit"] = True
-            st.session_state["generated_fields"] = []
+        st.write("")  # Spacer
+        st.write("")
+
+    # Show suggestions as buttons
+    for i, drug in enumerate(suggestions[:8]):
+        if st.button(drug, key=f"drug_{i}"):
+            st.session_state["selected_drugs"].append(drug)
             st.rerun()
 
-    with col3:
-        if st.button("Generate Random Record", key="btn_generate_record", use_container_width=True):
-            try:
-                artifacts = load_artifacts()
-                age, sex, meds, generated = _generate_record(
-                    artifacts["bundle"], artifacts["dictionary"]
-                )
-                st.session_state["prefill_age"] = age
-                st.session_state["prefill_sex"] = sex
-                st.session_state["prefill_meds"] = meds
-                st.session_state["auto_submit"] = True
-                st.session_state["generated_fields"] = generated
+    return ""
+
+
+def _render_selected_chips() -> None:
+    """Render selected drug chips."""
+    if not st.session_state.get("selected_drugs"):
+        return
+
+    st.markdown('<div class="drug-chips">', unsafe_allow_html=True)
+
+    drugs = st.session_state.get("selected_drugs", [])
+    for drug in drugs:
+        col1, col2 = st.columns([1, 0.1], gap="small")
+        with col1:
+            st.write(f"🔹 {drug}")
+        with col2:
+            if st.button("✕", key=f"remove_{drug}"):
+                st.session_state["selected_drugs"].remove(drug)
                 st.rerun()
-            except Exception as e:
-                st.error(f"Could not generate record: {e}")
 
-
-def _render_match_feedback(match_details: list[dict[str, Any]]) -> int:
-    if not match_details:
-        return 0
-
-    table = pd.DataFrame(match_details)
-    unmatched_count = int((table["status"] != "matched").sum())
-
-    display = table.rename(
-        columns={
-            "input": "Entered Medication",
-            "status": "Mapping Status",
-            "match": "Matched Dictionary Name",
-            "score": "Match Confidence",
-            "suggestions": "Suggested RapidFuzz Correction",
-            "used": "Included in Model Features",
-        }
-    )
-    display["Match Confidence"] = display["Match Confidence"].map(lambda v: f"{v:.0f}%")
-    display["Mapping Status"] = display["Mapping Status"].map(
-        lambda s: (
-            "Matched" if s == "matched" else ("Ambiguous" if s == "ambiguous" else "Unmatched")
-        )
-    )
-    display["Included in Model Features"] = display["Included in Model Features"].map(
-        lambda u: "Yes" if u else "No"
-    )
-
-    st.subheader("Medication Mapping Coverage")
-    st.dataframe(display, hide_index=True, use_container_width=True)
-
-    if unmatched_count > 0:
-        st.warning(
-            f"{unmatched_count} medication name(s) could not be mapped with >= 90% confidence. "
-            "Please review the suggestions above or confirm standard clinical generic spellings."
-        )
-    return unmatched_count
-
-
-def _render_result(
-    *,
-    probability: float,
-    threshold: float,
-    unmatched_count: int,
-    contributors: pd.DataFrame,
-    summary: dict[str, Any],
-) -> None:
-    label = _priority_label(probability, threshold)
-    is_high = probability >= threshold
-    score_class = "high" if is_high else ""
-    meaning, next_steps = _result_guidance(probability, threshold, unmatched_count)
-
-    st.markdown(
-        f"""
-        <section class="result-panel" aria-live="polite">
-          <h2>Model Priority Score</h2>
-          <div class="score-row">
-            <div class="score-value {score_class}">{probability:.0%}</div>
-            <div class="priority-badge {score_class}">{label}</div>
-          </div>
-          <div class="threshold-caption">Operating decision threshold: {threshold:.0%} | Trained Random Forest paradigm</div>
-          <div class="guidance-block">
-            <p><strong>What this means:</strong> {meaning}</p>
-            <p><strong>Next steps:</strong> {next_steps}</p>
-            <p class="disclaimer">{DISCLAIMER}</p>
-          </div>
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        f"""
-        <div class="status-grid">
-          <div class="status-card">
-            <span>Matched Medications</span>
-            <strong>{summary["Matched medications"]}</strong>
-          </div>
-          <div class="status-card">
-            <span>Highest Drug ROR</span>
-            <strong>{summary["Highest ROR"]:.2f}</strong>
-          </div>
-          <div class="status-card">
-            <span>Boxed Warning</span>
-            <strong>{summary["Boxed warning"]}</strong>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.subheader("Contribution to Model Score")
-    st.caption(
-        "Top feature contributions from the frozen model pipeline for this specific patient input."
-    )
-    st.dataframe(contributors, hide_index=True, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def main() -> None:
+    """Main app entry point."""
     st.set_page_config(
-        page_title="TekaRx Medication Priority Check",
-        page_icon="Rx",
+        page_title="TekaRx Priority Check",
+        page_icon="💊",
         layout="wide",
         initial_sidebar_state="collapsed",
     )
+
+    # Initialize session state
+    if "selected_drugs" not in st.session_state:
+        st.session_state["selected_drugs"] = []
+    if "last_prediction" not in st.session_state:
+        st.session_state["last_prediction"] = None
+
     _render_css()
     _render_header()
 
-    status = _artifact_status()
+    # Load artifacts
     try:
         artifacts = load_artifacts()
     except Exception as exc:
-        _show_missing_artifacts(status, exc)
+        st.error(
+            f"Failed to load model artifacts. "
+            f"Build them with:\n{BUILD_COMMANDS}\n\nError: {exc}"
+        )
         return
 
     bundle = artifacts["bundle"]
+    dictionary = artifacts["dictionary"]
     threshold = _threshold(bundle)
 
-    # Handle preset examples via session state
-    prefill_age = st.session_state.get("prefill_age", 65)
-    prefill_sex = st.session_state.get("prefill_sex", "Female")
-    prefill_meds = st.session_state.get("prefill_meds", "")
-    generated_fields = st.session_state.get("generated_fields", [])
-    sex_options = ("Female", "Male", "Unknown")
-    sex_index = sex_options.index(prefill_sex) if prefill_sex in sex_options else 2
+    # Tab navigation
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["New Check", "Results & Contributors", "Mapping Coverage", "About"]
+    )
 
-    auto_submit = st.session_state.pop("auto_submit", False)
+    with tab1:
+        st.subheader("Patient Regimen")
 
-    left, right = st.columns([0.9, 1.1], gap="large")
+        col1, col2 = st.columns(2, gap="large")
 
-    with left:
-        with st.form("prediction_form"):
-            st.subheader("Patient Regimen Entry")
-
-            # Age field with generated indicator
-            age_label = "Patient Age (years)"
-            if "age" in generated_fields:
-                age_label += " <span class='generated-badge'>Generated</span>"
+        with col1:
             age = st.number_input(
-                age_label,
+                "Patient Age (years)",
                 min_value=0,
                 max_value=120,
-                value=int(prefill_age),
+                value=65,
                 step=1,
-                help="Patient chronological age in years. Generated fields are editable.",
             )
-
-            # Sex field with generated indicator
-            sex_label = "Biological Sex"
-            if "sex" in generated_fields:
-                sex_label += " <span class='generated-badge'>Generated</span>"
             sex = st.selectbox(
-                sex_label,
-                sex_options,
-                index=sex_index,
-                help="Reported patient sex. Generated fields are editable.",
+                "Biological Sex",
+                ("Female", "Male", "Unknown"),
+                index=0,
             )
 
-            # Medications field with generated indicator
-            meds_label = "Active Medications"
-            if "medications" in generated_fields:
-                meds_label += " <span class='generated-badge'>Generated</span>"
-            medications = st.text_area(
-                meds_label,
-                value=prefill_meds,
-                height=180,
-                placeholder="Example:\nAspirin\nMetformin\nAtorvastatin\nLisinopril",
-                help="Enter one medication per line, or separate drug names with commas. Generated fields are editable.",
+        with col2:
+            st.write("")  # Spacer for alignment
+
+        st.markdown("---")
+
+        # Drug autocomplete
+        _drug_autocomplete(dictionary)
+
+        # Selected drugs
+        if st.session_state["selected_drugs"]:
+            st.markdown('<div class="drug-chips">', unsafe_allow_html=True)
+            st.write("**Selected medications:**")
+            drugs = st.session_state.get("selected_drugs", [])
+            for i, drug in enumerate(drugs):
+                c1, c2 = st.columns([0.95, 0.05], gap="small")
+                with c1:
+                    st.write(f"🔹 {drug}")
+                with c2:
+                    if st.button("✕", key=f"del_{drug}_{i}"):
+                        st.session_state["selected_drugs"].remove(drug)
+                        st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # Run score button
+        if st.button(
+            "Run TekaRx Score",
+            use_container_width=True,
+            type="primary",
+        ):
+            if not st.session_state["selected_drugs"]:
+                st.error("Please add at least one medication.")
+            else:
+                with st.spinner("Analyzing regimen..."):
+                    matched, match_details = _match_medications(
+                        st.session_state["selected_drugs"], dictionary
+                    )
+                    frame, summary = _build_features(age, sex, matched, bundle)
+                    probability = _predict(frame, artifacts)
+                    contributors = _top_contributors(bundle, frame)
+
+                    st.session_state["last_prediction"] = {
+                        "probability": probability,
+                        "threshold": threshold,
+                        "matched": matched,
+                        "match_details": match_details,
+                        "frame": frame,
+                        "summary": summary,
+                        "contributors": contributors,
+                        "age": age,
+                        "sex": sex,
+                    }
+
+                st.success("✓ Analysis complete! See Results & Contributors tab.")
+                st.info("Switch to the Results tab to view detailed findings.")
+
+    with tab2:
+        if not st.session_state["last_prediction"]:
+            st.markdown(
+                """
+                <div class="empty-state">
+                  <h3>No Results Yet</h3>
+                  <p>Run an analysis from the "New Check" tab to see results.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            submitted = st.form_submit_button("Run TekaRx score", use_container_width=True)
+        else:
+            pred = st.session_state["last_prediction"]
+            probability = pred["probability"]
+            is_high = probability >= pred["threshold"]
+            label = "Review Priority Signal" if is_high else "No Priority Signal"
 
-        st.caption(
-            f"{DISCLAIMER} Frozen model evaluates {len(bundle['feature_cols'])} relational and pharmacological features."
-        )
+            st.markdown(
+                f"""
+                <div class="score-section">
+                  <p style="margin: 0 0 0.5rem; color: var(--ink-light);
+                    font-size: 0.85rem; text-transform: uppercase;
+                    letter-spacing: 0.03em;">Model Priority Score</p>
+                  <p class="score-value {'high' if is_high else ''}">
+                    {probability:.0%}
+                  </p>
+                  <div class="priority-badge {'high' if is_high else ''}">
+                    {label}
+                  </div>
+                  <p class="threshold-note">
+                    Operating threshold: {pred['threshold']:.0%}
+                  </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-    queries = _parse_medications(medications)
-    trigger_run = submitted or auto_submit
+            # Guidance
+            if is_high:
+                meaning = (
+                    "Model priority signal detected. Review medications, "
+                    "interactions, and top contributors below."
+                )
+                next_steps = (
+                    "Conduct clinical review focusing on drug interactions "
+                    "and cumulative toxicities."
+                )
+            else:
+                meaning = "No priority signal under the trained IMRAD model."
+                next_steps = (
+                    "Continue standard monitoring; reassess if medications "
+                    "change or new symptoms develop."
+                )
 
-    # Clear generated_fields flag when user manually edits values
-    if submitted and generated_fields:
-        st.session_state["generated_fields"] = []
+            col1, col2 = st.columns(2, gap="large")
+            with col1:
+                st.markdown(
+                    f"""
+                    <div class="guidance-card">
+                      <h4>What This Means</h4>
+                      <p>{meaning}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-    with right:
-        if not trigger_run and not queries:
-            _render_empty_state()
-            return
+            with col2:
+                st.markdown(
+                    f"""
+                    <div class="guidance-card">
+                      <h4>Next Steps</h4>
+                      <p>{next_steps}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-        if trigger_run and not queries:
-            st.error("Please enter at least one medication name before running the evaluation.")
-            _render_empty_state()
-            return
+            # Status summary
+            st.markdown("### Summary")
+            st.markdown('<div class="status-grid">', unsafe_allow_html=True)
+            for label, value in [
+                ("Matched", pred["summary"]["Matched medications"]),
+                ("Highest ROR", f"{pred['summary']['Highest ROR']:.2f}"),
+                ("Boxed Warning", pred["summary"]["Boxed warning"]),
+            ]:
+                st.markdown(
+                    f"""
+                    <div class="status-item">
+                      <div class="status-label">{label}</div>
+                      <div class="status-value">{value}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            st.markdown("</div>", unsafe_allow_html=True)
 
-        with st.spinner("Mapping medications and executing frozen TekaRx pipeline..."):
-            matched, match_details = _match_medications(queries, artifacts["dictionary"])
-            frame, summary = _build_features(age, sex, matched, bundle)
-            probability = _predict(frame, artifacts)
-            contributors = _top_contributors(bundle, frame)
+            # Top contributors
+            st.markdown("### Top 5 Contributing Factors")
+            st.dataframe(
+                pred["contributors"],
+                hide_index=True,
+                use_container_width=True,
+            )
 
-        unmatched_count = _render_match_feedback(match_details)
-        _render_result(
-            probability=probability,
-            threshold=threshold,
-            unmatched_count=unmatched_count,
-            contributors=contributors,
-            summary=summary,
+            st.markdown(
+                f'<div class="disclaimer">{DISCLAIMER}</div>',
+                unsafe_allow_html=True,
+            )
+
+    with tab3:
+        if not st.session_state["last_prediction"]:
+            st.markdown(
+                """
+                <div class="empty-state">
+                  <h3>No Mapping Data Yet</h3>
+                  <p>Run an analysis to see medication matching results.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            pred = st.session_state["last_prediction"]
+            match_table = pd.DataFrame(pred["match_details"]).rename(
+                columns={
+                    "input": "Input",
+                    "status": "Status",
+                    "match": "Matched Name",
+                    "score": "Confidence %",
+                    "suggestions": "Suggestions",
+                    "used": "Used",
+                }
+            )
+            match_table["Confidence %"] = match_table["Confidence %"].map(
+                lambda v: f"{v:.0f}%"
+            )
+            match_table["Status"] = match_table["Status"].map(
+                lambda s: (
+                    "Matched"
+                    if s == "matched"
+                    else ("Ambiguous" if s == "ambiguous" else "Unmatched")
+                )
+            )
+            match_table["Used"] = match_table["Used"].map(lambda u: "Yes" if u else "No")
+
+            st.markdown("### Medication Mapping Coverage")
+            st.dataframe(match_table, hide_index=True, use_container_width=True)
+
+            unmatched = sum(
+                1 for m in pred["match_details"] if m["status"] == "unmatched"
+            )
+            if unmatched > 0:
+                st.warning(
+                    f"{unmatched} medication(s) not matched (< 90%). "
+                    "Review suggestions or verify spellings."
+                )
+
+    with tab4:
+        st.markdown(
+            """
+            ### How It Works
+
+            TekaRx uses a frozen Random Forest model trained on IMRAD
+            (Integrated Medication Risk Assessment) data to evaluate medication
+            regimens. The model scores combinations based on:
+
+            - **Drug characteristics**: ROR (Relative Odds Ratio) and ATC
+              classifications
+            - **Demographics**: Age and sex
+            - **Complexity**: Polypharmacy patterns and therapeutic overlaps
+
+            ### Key Limitations
+
+            - Free-text matching is approximate; unmatched drugs get suggestions
+            - Dosage, route, and reaction are not collected
+            - Model reflects training data patterns, not causality
+            - Results are research support, not medical diagnosis
+
+            ### Safety & Disclaimer
+
+            **{DISCLAIMER}**
+
+            This tool is for research and decision support only. Always
+            consult clinical judgment and comprehensive patient assessment
+            before making treatment changes.
+
+            ### Learn More
+
+            - [TekaRx Documentation](https://github.com/tekarx)
+            - [IMRAD Model Details](https://github.com/tekarx)
+            """,
+            unsafe_allow_html=True,
         )
 
 
