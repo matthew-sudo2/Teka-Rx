@@ -54,3 +54,11 @@ frontend/data/
 .vscode/
 .DS_Store
 Thumbs.db
+
+
+antislop.md
+
+# Anti-slop
+antislop-settings.toml
+
+AGENTS.md
