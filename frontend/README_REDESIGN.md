@@ -4,7 +4,7 @@
 
 This is the **modern, production-ready redesign** of the TekaRx medication priority checker. The original plain textarea app has been upgraded with:
 
-- **🔍 Smart autocomplete drug input**: Type "war" → suggests ["WARFARIN", "COZAAR", ...] → select via chips
+- **🔍 Dictionary-backed medication picker**: Search the loaded vocabulary and select drugs via chips
 - **📑 4-tab navigation**: New Check, Results & Contributors, Mapping Coverage, About
 - **🎨 Modern SaaS design**: Clinical green, soft cards, proper hierarchy, zero slop
 - **✨ Polished UI states**: Empty, loading, error, and success all designed
@@ -70,14 +70,16 @@ Static content explaining how the model works, key limitations, the research dis
 ## Autocomplete Behavior
 
 ```
-User input: "war"
-    ↓ (RapidFuzz partial_ratio, 70% cutoff)
+User opens the medication picker
     ↓
-Suggestions: ["WARFARIN", "COZAAR", "MAZZARD", ...]
+Types "war" to filter the loaded dictionary
     ↓
-User clicks "WARFARIN"
+User selects "WARFARIN"
     ↓
-Chip added: 🔹 Warfarin (✕)
+Chip added with a Remove button
+
+Only values from `drug_dictionary.parquet["faers_raw"]` can be selected. Free-text
+medication names are not accepted by the demo form.
     ↓
 User can remove (✕) or select another
 ```

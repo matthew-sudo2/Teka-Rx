@@ -1358,53 +1358,68 @@ def main() -> None:
                     key="input_sex",
                 )
 
-            # Autocomplete & Quick-Add
+            # Dictionary-backed medication picker
             st.markdown(
                 '<p style="font-size: 0.84rem; color: var(--text-secondary); '
                 'margin: 12px 0 4px 0; font-weight: 500;">'
-                "Search & Quick-Add Medication</p>",
+                "Add Medication from Dictionary</p>",
                 unsafe_allow_html=True,
             )
-            search_query = st.text_input(
-                "Medication search",
-                key="drug_search_box",
-                placeholder="Type drug prefix (e.g. Warfarin, Aspirin)...",
-                label_visibility="collapsed",
+            medication_choices = sorted(
+                dictionary["faers_raw"]
+                .dropna()
+                .drop_duplicates()
+                .astype(str)
+                .tolist()
             )
+            selected_drugs = st.session_state["selected_drugs"]
+            selected_drug = st.selectbox(
+                "Choose a medication",
+                [None, *medication_choices],
+                format_func=lambda value: (
+                    "Select a medication..." if value is None else value
+                ),
+                index=0,
+                help=(
+                    "Only medications in the loaded TekaRx dictionary can be added. "
+                    "Type to search, then tap a result."
+                ),
+            )
+            if selected_drug is not None and selected_drug not in selected_drugs:
+                selected_drugs.append(selected_drug)
+                st.session_state["input_meds"] = "\n".join(selected_drugs)
+                st.session_state["prefill_meds"] = st.session_state["input_meds"]
+                st.rerun()
 
-            if search_query:
-                suggestions = _get_drug_suggestions(
-                    search_query, dictionary, limit=6
+            st.markdown(
+                '<p style="font-size: 0.84rem; color: var(--text-secondary); '
+                'margin: 12px 0 4px 0; font-weight: 500;">'
+                "Active Medications</p>",
+                unsafe_allow_html=True,
+            )
+            if selected_drugs:
+                st.caption(
+                    "Selected medications are confirmed against the TekaRx dictionary."
                 )
-                if suggestions:
-                    st.caption("Click a suggested medication to add it immediately:")
-                    sug_cols = st.columns(min(len(suggestions), 3))
-                    for i, drug_sug in enumerate(suggestions):
-                        target_col = sug_cols[i % len(sug_cols)]
-                        with target_col:
-                            if st.button(
-                                f"+ {drug_sug}",
-                                key=f"sug_add_{i}_{drug_sug}",
-                                use_container_width=True,
-                            ):
-                                current_raw = st.session_state.get("input_meds", "")
-                                existing_list = _parse_medications(current_raw)
-                                if drug_sug not in existing_list:
-                                    existing_list.append(drug_sug)
-                                    new_meds_text = "\n".join(existing_list)
-                                    st.session_state["input_meds"] = new_meds_text
-                                    st.session_state["prefill_meds"] = new_meds_text
-                                    if drug_sug not in st.session_state.get("selected_drugs", []):
-                                        st.session_state["selected_drugs"].append(drug_sug)
-                                st.rerun()
-
-            # Active Regimen Text Area
-            meds_input = st.text_area(
-                "Active Medications (one per line or comma-separated)",
-                height=140,
-                placeholder="Aspirin\nMetformin\nAtorvastatin",
-                key="input_meds",
-            )
+                for index, drug in enumerate(selected_drugs):
+                    drug_col, remove_col = st.columns([5, 1])
+                    with drug_col:
+                        st.markdown(
+                            f'<div class="med-chip">{html.escape(drug)}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    with remove_col:
+                        if st.button(
+                            "Remove",
+                            key=f"remove_medication_{index}",
+                            use_container_width=True,
+                        ):
+                            selected_drugs.pop(index)
+                            st.session_state["input_meds"] = "\n".join(selected_drugs)
+                            st.session_state["prefill_meds"] = st.session_state["input_meds"]
+                            st.rerun()
+            else:
+                st.info("Choose at least one medication from the dictionary.")
 
             # Action Button
             run_clicked = st.button(
@@ -1418,8 +1433,7 @@ def main() -> None:
         should_run = run_clicked or st.session_state.get("auto_submit", False)
         if should_run:
             st.session_state["auto_submit"] = False
-            active_meds_text = st.session_state.get("input_meds", meds_input)
-            parsed_meds = _parse_medications(active_meds_text)
+            parsed_meds = list(st.session_state.get("selected_drugs", []))
             if not parsed_meds:
                 st.warning("Please enter at least one active medication.")
             else:

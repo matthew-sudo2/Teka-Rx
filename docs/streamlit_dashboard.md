@@ -34,8 +34,9 @@ jupyter nbconvert --to notebook --execute notebooks/TekaRx_IMRAD_Models.ipynb --
 ## Visitor Workflow
 
 The dashboard is built around one task: enter age, sex, and medications, then run the TekaRx
-score. Medication names are fuzzy-matched with RapidFuzz against
-`drug_dictionary.parquet["faers_raw"]`. The result includes:
+score. Medications are selected from a searchable dropdown backed by
+`drug_dictionary.parquet["faers_raw"]`, so the demo form cannot submit a medication
+that is absent from the loaded dictionary. The result includes:
 
 - Model Priority Score with the frozen threshold
 - No Priority Signal or Review Priority Signal label
@@ -64,7 +65,8 @@ The dashboard follows the same model path: bundle imputer, bundle scaler, then
 
 ## Known Limitations
 
-- Free-text medication matching is approximate. Confirm ambiguous and unmatched names.
+- The medication picker only includes names present in the loaded dictionary. Dictionary
+  coverage still limits which compounds can be selected.
 - Dosage, reaction, route, and patient-specific graph inputs are not collected in the form, so
   unavailable values remain train-fitted imputer defaults.
 - Model probabilities reflect the training data and calibration. They do not establish drug
