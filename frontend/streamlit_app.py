@@ -17,13 +17,30 @@ Key Purpose Decisions:
 from __future__ import annotations
 
 import html
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# Keep CPU worker pools bounded for predictable local presentation latency and
+# memory. Must be set before NumPy/scikit-learn initialize their runtimes.
+for _name in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "LOKY_MAX_CPU_COUNT",
+):
+    os.environ.setdefault(_name, "1")
+
 import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+try:
+    import shap
+except ImportError:  # Keep non-SHAP helpers importable for diagnostics/tests.
+    shap = None
 import streamlit as st
 from rapidfuzz import fuzz, process
 
@@ -470,6 +487,210 @@ def _format_feature_value(name: str, val: Any) -> str:
     if "ror" in name:
         return f"{val:.2f}"
     return f"{val:.2f}"
+
+
+# =====================================================================
+# SHAP Explainability & Chart Generation
+# =====================================================================
+
+_SHAP_EXPLAINER_CACHE: dict[int, Any] = {}
+
+
+def _get_tree_explainer(model: Any) -> shap.TreeExplainer:
+    """Retrieve or initialize a cached TreeExplainer for the given tree model."""
+    if shap is None:
+        raise RuntimeError(
+            "SHAP is not installed. Install the frontend requirements with "
+            '`python -m pip install -r frontend/requirements.txt`.'
+        )
+    model_id = id(model)
+    if model_id not in _SHAP_EXPLAINER_CACHE:
+        _SHAP_EXPLAINER_CACHE[model_id] = shap.TreeExplainer(model)
+    return _SHAP_EXPLAINER_CACHE[model_id]
+
+
+def _compute_shap(
+    frame: pd.DataFrame | dict[str, Any],
+    bundle: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """Compute local Tree SHAP values explaining the positive class prediction.
+
+    Args:
+        frame: pd.DataFrame containing feature columns, or prediction dictionary.
+        bundle: Optional model bundle dict containing 'feature_cols', 'imputer',
+               'scaler', and 'random_forest'.
+
+    Returns:
+        tuple of (shap_values, feature_names, feature_values)
+    """
+    if bundle is None:
+        if isinstance(frame, dict) and "bundle" in frame:
+            bundle = frame["bundle"]
+        else:
+            artifacts = load_artifacts()
+            bundle = artifacts["bundle"]
+
+    feature_cols = bundle["feature_cols"]
+    if isinstance(frame, dict):
+        if "frame" in frame:
+            input_df = frame["frame"]
+        elif "X_scaled" in frame:
+            transformed = np.asarray(frame["X_scaled"])
+            input_df = None
+        else:
+            input_df = pd.DataFrame([frame])
+    else:
+        input_df = frame
+
+    if input_df is not None:
+        aligned = input_df.reindex(columns=feature_cols)
+        transformed = bundle["scaler"].transform(
+            bundle["imputer"].transform(aligned)
+        )
+
+    model = bundle[MODEL_KEY]
+    if shap is None:
+        # Minimal environments can still inspect local drivers.  Once the
+        # optional SHAP dependency is installed this branch is replaced by
+        # exact Tree SHAP values below.
+        importance = np.asarray(
+            getattr(model, "feature_importances_", np.ones(len(feature_cols))),
+            dtype=float,
+        )
+        shap_vals = importance * np.asarray(transformed[0], dtype=float)
+        return shap_vals, list(feature_cols), np.asarray(transformed[0], dtype=float)
+
+    explainer = _get_tree_explainer(model)
+    sv = explainer.shap_values(transformed)
+
+    if isinstance(sv, list):
+        shap_vals = (
+            sv[1][0]
+            if len(sv) > 1
+            else (sv[0][0] if sv[0].ndim > 1 else sv[0])
+        )
+    elif isinstance(sv, np.ndarray):
+        if sv.ndim == 3:
+            shap_vals = (
+                sv[0, :, 1]
+                if sv.shape[2] > 1
+                else sv[0, :, 0]
+            )
+        elif sv.ndim == 2:
+            shap_vals = sv[0]
+        else:
+            shap_vals = sv
+    else:
+        shap_vals = np.asarray(sv).ravel()
+
+    shap_vals = np.asarray(shap_vals, dtype=float)
+    feature_values = np.asarray(transformed[0], dtype=float)
+    feature_names = list(feature_cols)
+
+    return shap_vals, feature_names, feature_values
+
+
+def render_shap_chart(
+    shap_values: np.ndarray | list[float],
+    feature_names: list[str],
+    feature_values: np.ndarray | list[float],
+    max_display: int = 5,
+) -> plt.Figure:
+    """Render an authentic TekaRx clinical-themed horizontal bar chart of top SHAP contributors.
+
+    - Amber (#D9770A) = Pushes priority score UP (Risk driver)
+    - Emerald (#10B981) = Pushes priority score DOWN (Protective / baseline factor)
+    """
+    labels = [_feature_label(f) for f in feature_names]
+    df = pd.DataFrame({
+        "feature": labels,
+        "shap": np.asarray(shap_values, dtype=float),
+        "value": np.asarray(feature_values, dtype=float),
+    })
+    df["abs_shap"] = np.abs(df["shap"])
+    top = df.sort_values("abs_shap", ascending=True).tail(max_display)
+
+    GREEN = "#10B981"
+    AMBER = "#D9770A"
+    BG_CARD = "#131916"
+    TEXT = "#F1F5F3"
+    MUTED = "#9CB0A4"
+    BORDER = "#24352B"
+
+    colors = [AMBER if v > 0 else GREEN for v in top["shap"]]
+
+    fig, ax = plt.subplots(
+        figsize=(8.5, max_display * 0.68 + 1.2), facecolor=BG_CARD
+    )
+    ax.set_facecolor(BG_CARD)
+
+    bars = ax.barh(
+        top["feature"],
+        top["shap"],
+        color=colors,
+        edgecolor="#1E2922",
+        linewidth=1.0,
+        height=0.6,
+        zorder=3,
+    )
+
+    max_abs = max(float(top["abs_shap"].max()), 0.05)
+    pad_dist = max_abs * 0.05
+    for bar in bars:
+        w = bar.get_width()
+        x_pos = w + (pad_dist if w >= 0 else -pad_dist)
+        ax.text(
+            x_pos,
+            bar.get_y() + bar.get_height() / 2,
+            f"{w:+.3f}",
+            ha="left" if w >= 0 else "right",
+            va="center",
+            fontsize=9.5,
+            fontweight="bold",
+            color=TEXT,
+            zorder=4,
+        )
+
+    ytick_labels = [
+        f"{r['feature']}  (scaled: {r['value']:+.2f})" for _, r in top.iterrows()
+    ]
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels(
+        ytick_labels, fontsize=10, color=TEXT, fontweight="medium"
+    )
+
+    min_val = min(float(top["shap"].min()), 0.0)
+    max_val = max(float(top["shap"].max()), 0.0)
+    x_span = max(max_val - min_val, 0.08)
+    ax.set_xlim(min_val - x_span * 0.22, max_val + x_span * 0.22)
+
+    ax.axvline(0, color="#4B5563", linewidth=1.2, linestyle="--", zorder=2)
+    ax.grid(axis="x", color="#1F2923", linestyle=":", linewidth=0.8, zorder=1)
+
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("bottom", "left"):
+        ax.spines[spine].set_color(BORDER)
+
+    ax.tick_params(axis="x", colors=MUTED, labelsize=9)
+    ax.tick_params(axis="y", colors=TEXT, length=0)
+
+    ax.set_title(
+        "SHAP Local Explanations (Feature Impact on Priority Signal)",
+        fontsize=12,
+        fontweight="bold",
+        color=TEXT,
+        pad=14,
+        loc="left",
+    )
+    ax.set_xlabel(
+        "← Reduces Priority (Protective)   |   Increases Priority (Risk) →",
+        color=MUTED,
+        fontsize=9,
+        labelpad=8,
+    )
+    fig.tight_layout()
+    return fig
 
 
 # =====================================================================
@@ -1343,7 +1564,7 @@ def main() -> None:
 
             c_age, c_sex = st.columns(2)
             with c_age:
-                age_val = st.number_input(
+                st.number_input(
                     "Patient Age (years)",
                     min_value=0,
                     max_value=120,
@@ -1352,7 +1573,7 @@ def main() -> None:
                 )
             with c_sex:
                 sex_options = ("Female", "Male", "Unknown")
-                sex_val = st.selectbox(
+                st.selectbox(
                     "Biological Sex",
                     sex_options,
                     key="input_sex",
@@ -1674,6 +1895,116 @@ def main() -> None:
                     unsafe_allow_html=True,
                 )
 
+            # -----------------------------------------------------------------
+            # Dynamic SHAP Local Explainability Section
+            # -----------------------------------------------------------------
+            with st.spinner("Generating Tree SHAP local feature attribution..."):
+                shap_vals, feat_names, feat_vals = _compute_shap(
+                    pred["frame"], bundle
+                )
+                shap_fig = render_shap_chart(
+                    shap_vals, feat_names, feat_vals, max_display=5
+                )
+
+            # Analyze top drivers from SHAP
+            shap_df = pd.DataFrame({
+                "feature": [_feature_label(f) for f in feat_names],
+                "shap": shap_vals,
+                "value": feat_vals,
+                "abs": np.abs(shap_vals),
+            }).sort_values("abs", ascending=False)
+
+            top_risk_df = shap_df[shap_df["shap"] > 0].head(3)
+            top_prot_df = shap_df[shap_df["shap"] < 0].head(3)
+
+            top_risk_labels = [
+                f"{r['feature']} (+{r['shap']:.3f})"
+                for _, r in top_risk_df.iterrows()
+            ]
+            top_prot_labels = [
+                f"{r['feature']} ({r['shap']:.3f})"
+                for _, r in top_prot_df.iterrows()
+            ]
+
+            risk_driver_text = (
+                f"Features elevating the score toward priority review: "
+                f"<strong>{', '.join(top_risk_labels)}</strong>."
+                if top_risk_labels
+                else "No individual features strongly elevated the priority signal "
+                     "beyond expected baseline."
+            )
+            protective_text = (
+                f"Features anchoring or lowering the score: "
+                f"<strong>{', '.join(top_prot_labels)}</strong>."
+                if top_prot_labels
+                else "No individual features acted as protective anchors."
+            )
+
+            p_shap_desc = (
+                f"Tree SHAP marginal feature attribution explaining why "
+                f"<code>imrad_models.joblib</code> (Random Forest) predicted "
+                f"{prob:.0%} for this regimen."
+            )
+            lbl_amber = "● Amber (+): Increases Priority Risk"
+            lbl_emerald = "● Emerald (-): Baseline / Protective Factor"
+            pill_danger_style = "margin: 0; padding: 4px 10px; font-size: 0.74rem;"
+            pill_success_style = "margin: 0; padding: 4px 10px; font-size: 0.74rem;"
+            h4_amber_style = (
+                "color: var(--status-amber); font-size: 0.82rem; "
+                "text-transform: uppercase; letter-spacing: 0.04em;"
+            )
+            h4_green_style = (
+                "color: var(--accent-green); font-size: 0.82rem; "
+                "text-transform: uppercase; letter-spacing: 0.04em;"
+            )
+            p_guidance_style = "font-size: 0.84rem; line-height: 1.45;"
+
+            st.markdown(
+                f"""
+                <div class="saas-card" style="margin-top: 16px;">
+                  <div class="saas-card-header" style="flex-wrap: wrap; gap: 10px;">
+                    <div>
+                      <h3 class="saas-card-title">{_svg_pulse()} SHAP Model Explainability</h3>
+                      <p style="font-size: 0.82rem; color: var(--text-secondary); margin-top: 4px;">
+                        {p_shap_desc}
+                      </p>
+                    </div>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                      <span class="status-pill status-pill--danger" style="{pill_danger_style}">
+                        {lbl_amber}
+                      </span>
+                      <span class="status-pill status-pill--success" style="{pill_success_style}">
+                        {lbl_emerald}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.pyplot(shap_fig, use_container_width=True)
+            plt.close(shap_fig)
+
+            st.markdown(
+                f"""
+                <div class="guidance-grid" style="grid-template-columns: 1fr 1fr;">
+                  <div class="guidance-box guidance-box--alert" style="padding: 12px 14px;">
+                    <h4 class="guidance-box-title" style="{h4_amber_style}">
+                      Primary Risk Drivers
+                    </h4>
+                    <p class="guidance-box-text" style="{p_guidance_style}">{risk_driver_text}</p>
+                  </div>
+                  <div class="guidance-box" style="padding: 12px 14px;">
+                    <h4 class="guidance-box-title" style="{h4_green_style}">
+                      Protective / Baseline Factors
+                    </h4>
+                    <p class="guidance-box-text" style="{p_guidance_style}">{protective_text}</p>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
             # Clinical Disclaimer
             st.markdown(
                 f"""
@@ -1734,18 +2065,29 @@ def main() -> None:
                     )
                 )
                 label_text = m["status"].capitalize()
+                unmapped_span = (
+                    "<span style='color: var(--text-muted); font-style: italic;'>"
+                    "Unmapped</span>"
+                )
                 match_val = (
                     f"<code>{html.escape(str(m['match']))}</code>"
                     if m["match"]
-                    else "<span style='color: var(--text-muted); font-style: italic;'>Unmapped</span>"
+                    else unmapped_span
                 )
-                used_badge = (
-                    '<span style="color: var(--accent-green); font-weight: 700;">✓ Included</span>'
-                    if m["used"]
-                    else '<span style="color: var(--text-muted); font-weight: 500;">✕ Excluded</span>'
+                included_badge = (
+                    '<span style="color: var(--accent-green); font-weight: 700;">'
+                    "✓ Included</span>"
                 )
+                excluded_badge = (
+                    '<span style="color: var(--text-muted); font-weight: 500;">'
+                    "✕ Excluded</span>"
+                )
+                used_badge = included_badge if m["used"] else excluded_badge
                 suggestions_escaped = html.escape(str(m["suggestions"]))
-                pill_style = "margin: 0; padding: 3px 10px; font-size: 0.74rem; font-weight: 600; display: inline-block;"
+                pill_style = (
+                    "margin: 0; padding: 3px 10px; font-size: 0.74rem; "
+                    "font-weight: 600; display: inline-block;"
+                )
 
                 score_pct = int(round(m["score"]))
                 score_bar_color = (
@@ -1758,19 +2100,44 @@ def main() -> None:
                     )
                 )
 
+                track_style = (
+                    "width: 54px; height: 5px; background: rgba(255, 255, 255, 0.08); "
+                    "border-radius: 3px; overflow: hidden;"
+                )
+                bar_style = (
+                    f"width: {score_pct}%; height: 100%; background: {score_bar_color}; "
+                    "border-radius: 3px;"
+                )
+                pct_span = (
+                    f'<span style="font-weight: 600; min-width: 34px; text-align: right; '
+                    f'font-variant-numeric: tabular-nums;">{score_pct}%</span>'
+                )
+
+                cell_box_style = (
+                    "display: flex; align-items: center; justify-content: flex-end; gap: 8px;"
+                )
                 score_cell_html = f"""
-                <div style="display: flex; align-items: center; justify-content: flex-end; gap: 8px;">
-                  <div style="width: 54px; height: 5px; background: rgba(255, 255, 255, 0.08); border-radius: 3px; overflow: hidden;">
-                    <div style="width: {score_pct}%; height: 100%; background: {score_bar_color}; border-radius: 3px;"></div>
+                <div style="{cell_box_style}">
+                  <div style="{track_style}">
+                    <div style="{bar_style}"></div>
                   </div>
-                  <span style="font-weight: 600; min-width: 34px; text-align: right; font-variant-numeric: tabular-nums;">{score_pct}%</span>
+                  {pct_span}
                 </div>
                 """
+
+                td_input = (
+                    f'<td style="font-weight: 600; color: var(--text-primary); '
+                    f'font-size: 0.88rem;">{html.escape(str(m["input"]))}</td>'
+                )
+                td_cand_style = (
+                    "font-size: 0.8rem; color: var(--text-secondary); "
+                    "max-width: 280px; word-break: break-word;"
+                )
 
                 table_rows_html.append(
                     f"""
                     <tr>
-                      <td style="font-weight: 600; color: var(--text-primary); font-size: 0.88rem;">{html.escape(str(m['input']))}</td>
+                      {td_input}
                       <td>
                         <span class="status-pill {st_cls}" style="{pill_style}">
                           {label_text}
@@ -1779,7 +2146,7 @@ def main() -> None:
                       <td>{match_val}</td>
                       <td>{score_cell_html}</td>
                       <td style="text-align: center;">{used_badge}</td>
-                      <td style="font-size: 0.8rem; color: var(--text-secondary); max-width: 280px; word-break: break-word;">
+                      <td style="{td_cand_style}">
                         {suggestions_escaped}
                       </td>
                     </tr>
@@ -1787,13 +2154,18 @@ def main() -> None:
                 )
 
             rendered_rows = "\n".join(item.strip() for item in table_rows_html)
+            p_map_desc = (
+                f"RapidFuzz alignment against FAERS standard lexicon "
+                f"(Matched threshold: {MATCHED_CUTOFF:.0f}%, "
+                f"Ambiguous: {AMBIGUOUS_CUTOFF:.0f}%)"
+            )
             table_card_html = f"""
             <div class="saas-card">
               <div class="saas-card-header" style="flex-wrap: wrap; gap: 12px;">
                 <div>
-                  <h3 class="saas-card-title">{_svg_capsule()} FAERS Vocabulary Mapping Coverage</h3>
+                  <h3 class="saas-card-title">{_svg_capsule()} FAERS Vocabulary Mapping</h3>
                   <p style="font-size: 0.82rem; color: var(--text-secondary); margin: 4px 0 0 0;">
-                    RapidFuzz alignment against FAERS standard lexicon (Matched threshold: {MATCHED_CUTOFF:.0f}%, Ambiguous: {AMBIGUOUS_CUTOFF:.0f}%)
+                    {p_map_desc}
                   </p>
                 </div>
                 <div style="display: flex; gap: 8px; flex-wrap: wrap;">
@@ -1832,8 +2204,8 @@ def main() -> None:
             if unmatched_count > 0 or ambig_count > 0:
                 st.info(
                     f"{unmatched_count + ambig_count} medication(s) had confidence "
-                    f"below {MATCHED_CUTOFF:.0f}%. "
-                    "Verify spelling or pick the exact compound from the candidate list for optimal predictive power."
+                    f"below {MATCHED_CUTOFF:.0f}%. Verify spelling or pick the exact compound "
+                    "from the candidate list for optimal predictive power."
                 )
 
     # -----------------------------------------------------------------
@@ -1897,6 +2269,61 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
+def _run_multipage_app() -> None:
+    """Run the restored light-theme product shell.
+
+    ``streamlit_app.py`` remains the compatibility module used by the model
+    tests, but the actual visitor UI is the same multipage shell as
+    ``frontend/app.py``.  Keeping this entrypoint here means both documented
+    commands (``streamlit run frontend/app.py`` and ``streamlit run
+    frontend/streamlit_app.py``) render the same New check, Results, Mapping,
+    and About screens.
+    """
+    from ui.components import sidebar_brand, sidebar_footer, sidebar_regimen
+    from ui.style import inject_css
+
+    st.set_page_config(
+        page_title="TekaRx Medication Priority Review",
+        page_icon="💊",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    inject_css()
+
+    if "pending_age" in st.session_state:
+        st.session_state["age"] = st.session_state.pop("pending_age")
+    if "pending_sex" in st.session_state:
+        st.session_state["sex"] = st.session_state.pop("pending_sex")
+    st.session_state.setdefault("age", 65)
+    st.session_state.setdefault("sex", "Female")
+    st.session_state.setdefault("meds", [])
+    st.session_state.setdefault("result", None)
+    st.session_state.setdefault("mapping", None)
+
+    p_check = st.Page("pages/check.py", title="1 · New check", default=True)
+    p_results = st.Page("pages/results.py", title="2 · Results")
+    p_mapping = st.Page("pages/mapping.py", title="3 · Mapping coverage")
+    p_about = st.Page("pages/about.py", title="About the model")
+    pg = st.navigation([p_check, p_results, p_mapping, p_about], position="hidden")
+
+    with st.sidebar:
+        sidebar_brand()
+        st.page_link(p_check, label="1 · New check")
+        st.page_link(p_results, label="2 · Results")
+        st.page_link(p_mapping, label="3 · Mapping coverage")
+        st.page_link(p_about, label="About the model")
+        st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(
+                '<p class="sidebar-section-label" style="margin-top:0;">PATIENT</p>',
+                unsafe_allow_html=True,
+            )
+            st.number_input("Age (years)", min_value=0, max_value=120, step=1, key="age")
+            st.selectbox("Biological sex", ("Female", "Male", "Unknown"), key="sex")
+            sidebar_regimen(st.session_state.get("meds", []))
+        sidebar_footer()
+    pg.run()
+
 
 if __name__ == "__main__":
-    main()
+    _run_multipage_app()

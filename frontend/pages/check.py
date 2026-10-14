@@ -49,22 +49,17 @@ st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
 # ---- Card: Add a medication ----
 with card("Add a medication", "Search the TekaRx dictionary"):
-    medication_choices = sorted(
-        dictionary["faers_raw"].dropna().drop_duplicates().astype(str).tolist()
-    )
+    meds: list[str] = st.session_state.get("meds", [])
     selected_drug = st.selectbox(
         "Search medication",
-        [None, *medication_choices],
-        format_func=lambda v: "Select a medication…" if v is None else v,
+        [None, *artifacts["drug_choices"]],
+        format_func=lambda value: "Select a medication…" if value is None else value,
         index=0,
         label_visibility="collapsed",
         key="drug_picker",
     )
-
-    meds: list[str] = st.session_state.get("meds", [])
     if selected_drug is not None and selected_drug not in meds:
-        meds.append(selected_drug)
-        st.session_state["meds"] = meds
+        st.session_state["meds"] = [*meds, selected_drug]
         st.rerun()
 
     # Sample scenario buttons

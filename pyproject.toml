@@ -34,11 +34,12 @@ graph = [
   "xgboost>=2.1,<4",
 ]
 imrad = [
-  "scikit-learn>=1.5,<2",
+  "scikit-learn==1.9.1",
   "scipy>=1.13,<2",
   "pandas>=2.2,<3",
   "matplotlib>=3.9,<4",
   "seaborn>=0.13,<1",
+  "shap>=0.46,<1",
   "pyarrow>=18,<24",
 ]
 
