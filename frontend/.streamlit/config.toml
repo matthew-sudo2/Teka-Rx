@@ -8,3 +8,8 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+[server]
+# Avoid rescanning the large local artifact tree while presenting.
+fileWatcherType = "none"
+runOnSave = false

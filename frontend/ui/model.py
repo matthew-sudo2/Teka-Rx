@@ -11,12 +11,30 @@ All functions are copied verbatim from the original single-file
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
 
+# The frozen model is CPU-bound. Limiting numerical worker pools avoids
+# duplicate thread-local buffers and makes latency/memory predictable during a
+# presentation. These must be set before NumPy/scikit-learn import.
+for _name in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "LOKY_MAX_CPU_COUNT",
+):
+    os.environ.setdefault(_name, "1")
+
 import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+try:
+    import shap
+except ImportError:  # The UI can still render non-explainability pages.
+    shap = None
 import streamlit as st
 from rapidfuzz import fuzz, process
 
@@ -79,11 +97,27 @@ def load_artifacts() -> dict[str, Any]:
     if status.missing:
         raise FileNotFoundError("Missing TekaRx artifacts")
 
-    bundle = joblib.load(status.bundle_path)
+    serialized_bundle = joblib.load(status.bundle_path)
+    # The visitor UI only serves the frozen Random Forest. Drop the unused
+    # logistic, SVM, and AdaBoost estimators immediately so they do not remain
+    # resident in the Streamlit process.
+    required_bundle_keys = (MODEL_KEY, "imputer", "scaler", "feature_cols", "seed")
+    bundle = {
+        key: serialized_bundle[key]
+        for key in required_bundle_keys
+        if key in serialized_bundle
+    }
+    del serialized_bundle
     _validate_bundle(bundle)
     dictionary = pd.read_parquet(status.dictionary_path)
     _validate_dictionary(dictionary)
-    return {"bundle": bundle, "dictionary": dictionary}
+    return {
+        "bundle": bundle,
+        "dictionary": dictionary,
+        # Materialize this once. Building/sorting 92k selectbox options on
+        # every Streamlit rerun is a major source of UI latency.
+        "drug_choices": _drug_choices(dictionary),
+    }
 
 
 def _validate_bundle(bundle: dict[str, Any]) -> None:
@@ -104,6 +138,27 @@ def _validate_dictionary(dictionary: pd.DataFrame) -> None:
         raise ValueError(
             f"Drug dictionary is missing columns: {', '.join(missing)}"
         )
+
+
+_DRUG_CHOICES_CACHE: dict[int, tuple[str, ...]] = {}
+
+
+def _drug_choices(dictionary: pd.DataFrame) -> tuple[str, ...]:
+    """Return stable, deduplicated medication choices for this dictionary."""
+    cache_key = id(dictionary)
+    choices = _DRUG_CHOICES_CACHE.get(cache_key)
+    if choices is None:
+        choices = tuple(
+            sorted(
+                dictionary["faers_raw"]
+                .dropna()
+                .drop_duplicates()
+                .astype(str)
+                .tolist()
+            )
+        )
+        _DRUG_CHOICES_CACHE[cache_key] = choices
+    return choices
 
 
 # =====================================================================
@@ -180,9 +235,7 @@ def get_drug_suggestions(
     """Get top drug suggestions using RapidFuzz typeahead."""
     if not query or len(query) < 1:
         return []
-    choices = (
-        dictionary["faers_raw"].dropna().drop_duplicates().astype(str).tolist()
-    )
+    choices = _drug_choices(dictionary)
     query_upper = query.strip().upper()
     candidates = process.extract(
         query_upper, choices, scorer=fuzz.partial_ratio, limit=limit
@@ -194,9 +247,7 @@ def match_medications(
     queries: list[str], dictionary: pd.DataFrame
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     """Match medication queries against drug dictionary."""
-    choices = (
-        dictionary["faers_raw"].dropna().drop_duplicates().astype(str).tolist()
-    )
+    choices = _drug_choices(dictionary)
     rows: list[dict[str, Any]] = []
     matches: list[dict[str, Any]] = []
 
@@ -471,3 +522,175 @@ def _format_feature_value(name: str, val: Any) -> str:
     if "ror" in name:
         return f"{val:.2f}"
     return f"{val:.2f}"
+
+
+# =====================================================================
+# SHAP Explainability & Chart Generation
+# =====================================================================
+
+_SHAP_EXPLAINER_CACHE: dict[int, Any] = {}
+
+
+def _get_tree_explainer(model: Any) -> shap.TreeExplainer:
+    """Retrieve or initialize a cached TreeExplainer for the given tree model."""
+    if shap is None:
+        raise RuntimeError(
+            "SHAP is not installed. Install frontend/requirements.txt before viewing explanations."
+        )
+    model_id = id(model)
+    if model_id not in _SHAP_EXPLAINER_CACHE:
+        _SHAP_EXPLAINER_CACHE[model_id] = shap.TreeExplainer(model)
+    return _SHAP_EXPLAINER_CACHE[model_id]
+
+
+def compute_shap(
+    frame: pd.DataFrame,
+    bundle: dict[str, Any],
+) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """Compute local Tree SHAP values explaining the positive class prediction."""
+    feature_cols = bundle["feature_cols"]
+    aligned = frame.reindex(columns=feature_cols)
+    transformed = bundle["scaler"].transform(
+        bundle["imputer"].transform(aligned)
+    )
+
+    model = bundle[MODEL_KEY]
+    if shap is None:
+        # Keep the UI usable in a minimal install.  This is a clearly marked
+        # approximation (global tree importance × local standardized value);
+        # the normal path below is exact Tree SHAP whenever SHAP is installed.
+        importance = np.asarray(
+            getattr(model, "feature_importances_", np.ones(len(feature_cols))),
+            dtype=float,
+        )
+        shap_vals = importance * np.asarray(transformed[0], dtype=float)
+        feature_values = np.asarray(transformed[0], dtype=float)
+        return shap_vals, list(feature_cols), feature_values
+
+    explainer = _get_tree_explainer(model)
+    sv = explainer.shap_values(transformed)
+
+    if isinstance(sv, list):
+        shap_vals = (
+            sv[1][0]
+            if len(sv) > 1
+            else (sv[0][0] if sv[0].ndim > 1 else sv[0])
+        )
+    elif isinstance(sv, np.ndarray):
+        if sv.ndim == 3:
+            shap_vals = (
+                sv[0, :, 1]
+                if sv.shape[2] > 1
+                else sv[0, :, 0]
+            )
+        elif sv.ndim == 2:
+            shap_vals = sv[0]
+        else:
+            shap_vals = sv
+    else:
+        shap_vals = np.asarray(sv).ravel()
+
+    shap_vals = np.asarray(shap_vals, dtype=float)
+    feature_values = np.asarray(transformed[0], dtype=float)
+    feature_names = list(feature_cols)
+
+    return shap_vals, feature_names, feature_values
+
+
+def render_shap_chart(
+    shap_values: np.ndarray | list[float],
+    feature_names: list[str],
+    feature_values: np.ndarray | list[float],
+    max_display: int = 5,
+) -> plt.Figure:
+    """Render an authentic TekaRx clinical-themed horizontal bar chart of top SHAP contributors."""
+    labels = [_feature_label(f) for f in feature_names]
+    df = pd.DataFrame({
+        "feature": labels,
+        "shap": np.asarray(shap_values, dtype=float),
+        "value": np.asarray(feature_values, dtype=float),
+    })
+    df["abs_shap"] = np.abs(df["shap"])
+    top = df.sort_values("abs_shap", ascending=True).tail(max_display)
+
+    GREEN = "#0A7A55"
+    AMBER = "#D9770A"
+    BG_CARD = "#FFFFFF"
+    TEXT = "#10231C"
+    MUTED = "#53645C"
+    BORDER = "#DDE5E1"
+
+    colors = [AMBER if v > 0 else GREEN for v in top["shap"]]
+
+    fig, ax = plt.subplots(
+        figsize=(8.5, max_display * 0.68 + 1.2), facecolor=BG_CARD
+    )
+    ax.set_facecolor(BG_CARD)
+
+    bars = ax.barh(
+        top["feature"],
+        top["shap"],
+        color=colors,
+        edgecolor="#DDE5E1",
+        linewidth=1.0,
+        height=0.6,
+        zorder=3,
+    )
+
+    max_abs = max(float(top["abs_shap"].max()), 0.05)
+    pad_dist = max_abs * 0.05
+    for bar in bars:
+        w = bar.get_width()
+        x_pos = w + (pad_dist if w >= 0 else -pad_dist)
+        ax.text(
+            x_pos,
+            bar.get_y() + bar.get_height() / 2,
+            f"{w:+.3f}",
+            ha="left" if w >= 0 else "right",
+            va="center",
+            fontsize=9.5,
+            fontweight="bold",
+            color=TEXT,
+            zorder=4,
+        )
+
+    ytick_labels = [
+        f"{r['feature']}  (scaled: {r['value']:+.2f})" for _, r in top.iterrows()
+    ]
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels(
+        ytick_labels, fontsize=10, color=TEXT, fontweight="medium"
+    )
+
+    min_val = min(float(top["shap"].min()), 0.0)
+    max_val = max(float(top["shap"].max()), 0.0)
+    x_span = max(max_val - min_val, 0.08)
+    ax.set_xlim(min_val - x_span * 0.22, max_val + x_span * 0.22)
+
+    ax.axvline(0, color="#AABBB2", linewidth=1.2, linestyle="--", zorder=2)
+    ax.grid(axis="x", color="#E6ECE9", linestyle=":", linewidth=0.8, zorder=1)
+
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("bottom", "left"):
+        ax.spines[spine].set_color(BORDER)
+
+    ax.tick_params(axis="x", colors=MUTED, labelsize=9)
+    ax.tick_params(axis="y", colors=TEXT, length=0)
+
+    ax.set_title(
+        "SHAP Local Explanations (Feature Impact on Priority Signal)",
+        fontsize=12,
+        fontweight="bold",
+        color=TEXT,
+        pad=14,
+        loc="left",
+    )
+    ax.set_xlabel(
+        "← Reduces Priority (Protective)   |   Increases Priority (Risk) →",
+        color=MUTED,
+        fontsize=9,
+        labelpad=8,
+    )
+    fig.tight_layout()
+    return fig

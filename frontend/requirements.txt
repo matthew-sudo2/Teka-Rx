@@ -1,8 +1,10 @@
 streamlit>=1.40
 pandas>=2.2
 numpy>=1.26
-scikit-learn>=1.5
+# imrad_models.joblib was serialized with scikit-learn 1.9.1.
+scikit-learn==1.9.1
 pyarrow>=18
 joblib>=1.4
 rapidfuzz>=3.12
 matplotlib>=3.9
+shap>=0.46
