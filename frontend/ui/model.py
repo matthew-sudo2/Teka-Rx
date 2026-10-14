@@ -69,6 +69,52 @@ MAINTENANCE_AGE = 52
 MAINTENANCE_SEX = "Male"
 
 
+def generate_scenario_record(
+    scenario: str, dictionary: pd.DataFrame
+) -> tuple[float, str, list[str]]:
+    """Generate a fresh example record while preserving its scenario shape.
+
+    ``high`` always has an older patient and at least five unique medications
+    (polypharmacy). ``maintenance`` always has one medication (monotherapy).
+    The sampled names come from the loaded dictionary so every example can be
+    matched and scored by the same production path as user-entered records.
+    """
+    choices = np.asarray(_drug_choices(dictionary), dtype=object)
+    if not len(choices):
+        raise ValueError("The drug dictionary contains no medication choices")
+
+    rng = np.random.default_rng()
+    scenario_key = scenario.strip().lower()
+
+    if scenario_key in {"high", "high-priority", "polypharmacy"}:
+        age = float(rng.integers(65, 91))
+        sex = str(rng.choice(["Female", "Male", "Unknown"]))
+        target_count = min(len(choices), int(rng.integers(5, 9)))
+
+        # Keep the example recognisably high-priority when the seed drugs are
+        # present, then fill the remaining slots with fresh random choices.
+        preferred = [drug for drug in HIGH_PRIORITY_MEDS if drug in set(choices)]
+        selected = []
+        if preferred:
+            selected.append(str(rng.choice(preferred)))
+        remaining = np.asarray([drug for drug in choices if drug not in selected])
+        if target_count > len(selected):
+            selected.extend(
+                rng.choice(remaining, size=target_count - len(selected), replace=False).tolist()
+            )
+        return age, sex, selected
+
+    if scenario_key in {"maintenance", "maintenance-monotherapy", "monotherapy"}:
+        age = float(rng.integers(40, 71))
+        sex = str(rng.choice(["Female", "Male", "Unknown"]))
+        return age, sex, [str(rng.choice(choices))]
+
+    if scenario_key == "random":
+        return generate_record({}, dictionary)
+
+    raise ValueError(f"Unknown example scenario: {scenario}")
+
+
 # =====================================================================
 # Model Artifacts & Validation
 # =====================================================================

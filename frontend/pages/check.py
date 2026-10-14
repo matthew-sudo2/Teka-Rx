@@ -6,14 +6,9 @@ import streamlit as st
 from ui.components import card, empty_state, page_header
 from ui.model import (
     BUILD_COMMANDS,
-    HIGH_PRIORITY_AGE,
-    HIGH_PRIORITY_MEDS,
-    HIGH_PRIORITY_SEX,
-    MAINTENANCE_AGE,
-    MAINTENANCE_MEDS,
-    MAINTENANCE_SEX,
     build_features,
     generate_record,
+    generate_scenario_record,
     load_artifacts,
     match_medications,
     predict,
@@ -72,15 +67,17 @@ with card("Add a medication", "Search the TekaRx dictionary"):
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("High-priority polypharmacy", key="ex_high", use_container_width=True):
-            st.session_state["pending_age"] = HIGH_PRIORITY_AGE
-            st.session_state["pending_sex"] = HIGH_PRIORITY_SEX
-            st.session_state["meds"] = list(HIGH_PRIORITY_MEDS)
+            age_g, sex_g, meds_g = generate_scenario_record("high", dictionary)
+            st.session_state["pending_age"] = age_g
+            st.session_state["pending_sex"] = sex_g
+            st.session_state["meds"] = meds_g
             st.rerun()
     with c2:
         if st.button("Maintenance monotherapy", key="ex_low", use_container_width=True):
-            st.session_state["pending_age"] = MAINTENANCE_AGE
-            st.session_state["pending_sex"] = MAINTENANCE_SEX
-            st.session_state["meds"] = list(MAINTENANCE_MEDS)
+            age_g, sex_g, meds_g = generate_scenario_record("maintenance", dictionary)
+            st.session_state["pending_age"] = age_g
+            st.session_state["pending_sex"] = sex_g
+            st.session_state["meds"] = meds_g
             st.rerun()
     with c3:
         if st.button("Random record", key="ex_random", use_container_width=True):
