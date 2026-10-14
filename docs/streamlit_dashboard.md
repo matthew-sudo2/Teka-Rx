@@ -14,7 +14,7 @@ From the repository root:
 
 ```powershell
 python -m pip install -r frontend/requirements.txt
-streamlit run frontend/streamlit_app.py
+streamlit run frontend/app.py
 ```
 
 The app expects:

@@ -6,6 +6,81 @@ engineering occurs.
 
 > Model outputs are research decision-support signals, not diagnoses or clinical advice.
 
+## Course deliverables
+
+This repository contains the reproducible implementation for the TekaRx medication-priority
+project:
+
+- **EDA and data preparation:** FAERS reports are normalized into leakage-aware cohorts, with
+  missingness indicators, medication/reaction counts, ROR summaries, ATC diversity, boxed-warning
+  flags, and train-only imputation/scaling.
+- **Required traditional models:** Logistic Regression is retained as a baseline; the required
+  comparison models are Random Forest, SVM, and AdaBoost. The final evaluation uses a temporal
+  train/validation/test split rather than a random split.
+- **Evaluation:** AUROC, PR-AUC, precision, recall, F1, confusion counts, and threshold behavior
+  are reported. The saved comparison table is `data/processed/imrad_model_comparison.csv`.
+- **Explainability:** The Streamlit results page uses the frozen Random Forest bundle and SHAP
+  (with a documented fallback) to show which features contributed to each prediction.
+- **Application:** `frontend/app.py` is the Streamlit entrypoint. It provides medication mapping,
+  priority scoring, results, mapping coverage, and model documentation.
+- **Reproducibility:** source-quarter choices, preprocessing fit boundaries, random seeds, model
+  versions, and artifact paths are recorded in the notebook and build scripts. The raw data and
+  generated artifacts are intentionally ignored by Git because of their size and licensing.
+
+### Reproduce the modeling artifacts
+
+The following commands assume the required source data has been staged under `data/`:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev,imrad,notebook]"
+python build_cohort.py
+python build_drug_dictionary.py
+python build_imrad_artifacts.py
+```
+
+The model build writes:
+
+```text
+data/processed/drug_dictionary.parquet
+data/processed/models/imrad_models.joblib
+data/processed/imrad_model_comparison.csv
+```
+
+The serialized model is approximately 615 MB and is not committed to GitHub. To reproduce the
+Streamlit demo, place those artifacts at the paths above or download them from the configured
+artifact store.
+
+### Run and verify the Streamlit application
+
+```powershell
+python -m pip install -r frontend/requirements.txt
+python -m streamlit run frontend/app.py
+```
+
+Run the repository checks before submission:
+
+```powershell
+ruff check .
+pytest
+```
+
+For a public presentation without uploading the model, run Streamlit locally and expose port
+8501 with a temporary Cloudflare Tunnel. The tunnel URL is temporary and changes on restart.
+
+### EDA findings used in the report
+
+- The enriched cohort contains **2,208,704 reports**; serious outcomes account for **55.83%**.
+- Age and outcome codes are missing in about **44.2%** of reports; weight is missing in **83.4%**.
+- Polypharmacy is present in **16.5%** of reports. Medication count is long-tailed (median 1,
+  maximum 212), as are reactions and maximum ROR values (maximum ROR about 1,024.9).
+- The temporal test results favor Random Forest among the required models: AUROC **0.831** and
+  PR-AUC **0.863**. At the default threshold, precision is high but recall is limited (**0.216**),
+  so threshold selection is an important limitation.
+
+The system is a research prototype, not a diagnostic or prescribing tool.
+
 ## Repository layout
 
 ```text

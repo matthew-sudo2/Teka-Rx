@@ -8,7 +8,7 @@ predictions.
 
 ```powershell
 python -m pip install -r frontend/requirements.txt
-streamlit run frontend/streamlit_app.py
+streamlit run frontend/app.py
 ```
 
 The dashboard has one primary workflow: enter age, sex, and medication names, then run the

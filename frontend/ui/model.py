@@ -4,8 +4,8 @@ This module is imported by every page. It contains artifact loading,
 medication matching, feature engineering, prediction, and threshold
 retrieval. **No UI code lives here.**
 
-All functions are copied verbatim from the original single-file
-``streamlit_app.py`` to preserve scoring outputs exactly.
+The scoring helpers are kept separate from the Streamlit page modules so the
+same implementation is used by every page and remains easy to test.
 """
 
 from __future__ import annotations
